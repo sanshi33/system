@@ -1,0 +1,37 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2022-x64-release",
+      "displayName": "VS2022 x64 Release",
+      "description": "Visual Studio 2022 + vcpkg x64-windows",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "G:/vcpkg-2025.10.17/scripts/buildsystems/vcpkg.cmake",
+        "STITCH_VCPKG_ROOT": "G:/vcpkg-2025.10.17",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "OpenCV_DIR": "G:/vcpkg-2025.10.17/installed/x64-windows/share/opencv4",
+        "Eigen3_DIR": "G:/vcpkg-2025.10.17/installed/x64-windows/share/eigen3",
+        "GALAXY_SDK_ROOT": "G:/GalaxySDK",
+        "GALAXY_SDK_DEVELOPMENT": "G:/GalaxySDK/Development"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-release",
+      "configurePreset": "vs2022-x64-release",
+      "configuration": "Release"
+    }
+  ]
+}

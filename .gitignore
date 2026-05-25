@@ -1,0 +1,36 @@
+# Build artifacts
+/build/
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/Makefile
+/*.obj
+/*.exe
+/*.pdb
+/*.ilk
+/*.exp
+/*.lib
+/*.tlog
+/*.lastbuildstate
+/*.recipe
+/*.log
+
+# IDE / local workspace
+/.vscode/
+/.venv-figure/
+/*.user
+/*.suo
+/*.VC.db
+/*.opendb
+
+# Generated outputs
+/result/*
+!/result/KEPT_RESULTS_20260525.md
+/tmp/
+
+# Large local datasets / mounts
+/火焰筒/
+/std_sphere_input
+
+# Misc generated reports
+/*_quality_report.txt
