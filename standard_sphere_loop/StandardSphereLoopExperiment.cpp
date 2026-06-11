@@ -1334,6 +1334,63 @@ cv::Scalar paletteColor(std::size_t index)
     return kPalette[index % kPalette.size()];
 }
 
+cv::Mat cropWhiteMargin(const cv::Mat& image, int margin = 10, int threshold = 250)
+{
+    if (image.empty()) {
+        return {};
+    }
+
+    cv::Mat gray;
+    if (image.channels() == 1) {
+        gray = image;
+    } else {
+        cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+    }
+
+    cv::Mat mask;
+    cv::threshold(gray, mask, threshold, 255, cv::THRESH_BINARY_INV);
+    std::vector<cv::Point> nonZeroPoints;
+    cv::findNonZero(mask, nonZeroPoints);
+    if (nonZeroPoints.empty()) {
+        return image.clone();
+    }
+
+    cv::Rect bounds = cv::boundingRect(nonZeroPoints);
+    bounds.x = std::max(0, bounds.x - margin);
+    bounds.y = std::max(0, bounds.y - margin);
+    bounds.width = std::min(image.cols - bounds.x, bounds.width + margin * 2);
+    bounds.height = std::min(image.rows - bounds.y, bounds.height + margin * 2);
+    return image(bounds).clone();
+}
+
+void drawInfoBox(cv::Mat& canvas,
+                 const std::string& text,
+                 const cv::Point& anchor,
+                 double fontScale,
+                 const cv::Scalar& textColor,
+                 const cv::Scalar& fillColor = cv::Scalar(252, 252, 252),
+                 const cv::Scalar& borderColor = cv::Scalar(218, 218, 218),
+                 int thickness = 1)
+{
+    int baseline = 0;
+    const cv::Size textSize = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
+    const int paddingX = 10;
+    const int paddingY = 8;
+    cv::Rect box(anchor.x,
+                 anchor.y - textSize.height - paddingY,
+                 textSize.width + paddingX * 2,
+                 textSize.height + paddingY * 2 + baseline);
+    box &= cv::Rect(0, 0, canvas.cols, canvas.rows);
+    if (box.width <= 0 || box.height <= 0) {
+        return;
+    }
+
+    cv::rectangle(canvas, box, fillColor, cv::FILLED, cv::LINE_AA);
+    cv::rectangle(canvas, box, borderColor, 1, cv::LINE_AA);
+    const cv::Point textOrigin(box.x + paddingX, box.y + paddingY + textSize.height);
+    cv::putText(canvas, text, textOrigin, cv::FONT_HERSHEY_SIMPLEX, fontScale, textColor, thickness, cv::LINE_AA);
+}
+
 void updateBounds(cv::Rect2d& bounds, const cv::Point2d& point)
 {
     if (!std::isfinite(point.x) || !std::isfinite(point.y)) {
@@ -3164,27 +3221,25 @@ cv::Mat buildStitchedVisualization(const StandardSphereLoopResult& result,
                         0.03);
     }
 
-    const std::string title = "stitched standard sphere edge overlay";
-    cv::putText(canvas, title, cv::Point(18, 34), cv::FONT_HERSHEY_SIMPLEX,
-                0.8, cv::Scalar(35, 35, 35), 2, cv::LINE_AA);
-    cv::putText(canvas,
-                "colors = source images, black = fitted stitched circle, red arrow = loop drift",
-                cv::Point(18, 64),
-                cv::FONT_HERSHEY_SIMPLEX,
-                0.55,
-                cv::Scalar(65, 65, 65),
-                1,
-                cv::LINE_AA);
-    cv::putText(canvas,
-                "scale " + std::to_string(scale).substr(0, 5) + " px/px",
-                cv::Point(18, canvas.rows - 20),
-                cv::FONT_HERSHEY_SIMPLEX,
-                0.55,
-                cv::Scalar(65, 65, 65),
-                1,
-                cv::LINE_AA);
+    drawInfoBox(canvas, "Standard-sphere stitched contour", cv::Point(18, 34), 0.62, cv::Scalar(42, 42, 42));
+    std::ostringstream summary;
+    summary << edges.size() << " views | circle RMSE "
+            << std::fixed << std::setprecision(3) << result.stitchedCircle.rmsePx << " px";
+    if (!result.closureMatrix.empty()) {
+        summary << " | red arrow: closure drift";
+    }
+    drawInfoBox(canvas, summary.str(), cv::Point(18, 62), 0.46, cv::Scalar(72, 72, 72));
 
-    return canvas;
+    std::ostringstream closureInfo;
+    closureInfo << "closure drift " << std::fixed << std::setprecision(3) << result.closureTranslationPx << " px"
+                << " | black circle: fitted global circle";
+    drawInfoBox(canvas, closureInfo.str(), cv::Point(18, 90), 0.44, cv::Scalar(72, 72, 72));
+
+    std::ostringstream scaleInfo;
+    scaleInfo << "Display scale " << std::fixed << std::setprecision(3) << scale;
+    drawInfoBox(canvas, scaleInfo.str(), cv::Point(18, canvas.rows - 18), 0.44, cv::Scalar(72, 72, 72));
+
+    return cropWhiteMargin(canvas, 8);
 }
 
 } // namespace pinjie::standard_sphere_loop

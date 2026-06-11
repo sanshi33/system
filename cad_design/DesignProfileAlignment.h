@@ -49,6 +49,12 @@ struct DesignErrorSummary {
     double dzMm{0.0};
     double drMm{0.0};
     double dThetaDeg{0.0};
+    double axialScaleFactor{1.0};
+    double axialQuadraticTermMm{0.0};
+    bool appliedAbsoluteBiasRefine{false};
+    double absoluteBiasCorrectionUm{0.0};
+    double preRefineMeanNormalErrorUm{0.0};
+    double preRefineAbsoluteFilteredRmseUm{0.0};
     bool designReverseZ{true};
     bool useLeftEndpointAnchor{true};
     bool evaluateProfileForm{true};

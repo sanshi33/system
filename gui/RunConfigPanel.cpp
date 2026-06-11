@@ -366,6 +366,90 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     stitchForm->addRow(QStringLiteral("切向相关权重"), tangentCorrelationWeightSpin_);
 
     registrationLayout->addWidget(makeCollapsibleSection(QStringLiteral("基础参数"), stitchGroup, true, registrationSection_));
+
+    auto* standardCircleGroup = new QGroupBox(QStringLiteral("标准圆国标检测"), registrationSection_);
+    auto* standardCircleLayout = new QVBoxLayout(standardCircleGroup);
+    standardCircleLayout->setContentsMargins(8, 10, 8, 8);
+    standardCircleLayout->setSpacing(6);
+
+    standardCircleCheck_ = new QCheckBox(QStringLiteral("启用 GB/T 24762 5.7 标准圆检测流程"), standardCircleGroup);
+    standardCircleCheck_->setChecked(false);
+    standardCircleLayout->addWidget(standardCircleCheck_);
+
+    auto* standardCircleHintLabel = new QLabel(
+        QStringLiteral("该模式直接调用已验证的标准圆流程：掩模板预处理、全局拼接、椭圆修正、25 个测量窗口选点与 E_P2D 输出。"),
+        standardCircleGroup);
+    standardCircleHintLabel->setWordWrap(true);
+    standardCircleLayout->addWidget(standardCircleHintLabel);
+
+    auto* standardCircleForm = new QFormLayout();
+
+    standardCirclePrefixEdit_ = new QLineEdit(QStringLiteral("Pic_"), standardCircleGroup);
+    standardCircleExtensionEdit_ = new QLineEdit(QStringLiteral(".bmp"), standardCircleGroup);
+    standardCircleStartIndexSpin_ = new QSpinBox(standardCircleGroup);
+    standardCircleStartIndexSpin_->setRange(1, 999999);
+    standardCircleStartIndexSpin_->setValue(1);
+
+    standardCircleDiameterSpin_ = new QDoubleSpinBox(standardCircleGroup);
+    standardCircleDiameterSpin_->setRange(0.001, 100000.0);
+    standardCircleDiameterSpin_->setDecimals(5);
+    standardCircleDiameterSpin_->setValue(19.99995);
+    standardCircleDiameterSpin_->setSuffix(QStringLiteral(" mm"));
+
+    standardCircleHorizontalFovSpin_ = new QDoubleSpinBox(standardCircleGroup);
+    standardCircleHorizontalFovSpin_->setRange(0.001, 100000.0);
+    standardCircleHorizontalFovSpin_->setDecimals(3);
+    standardCircleHorizontalFovSpin_->setValue(40.0);
+    standardCircleHorizontalFovSpin_->setSuffix(QStringLiteral(" mm"));
+
+    standardCircleVerticalFovSpin_ = new QDoubleSpinBox(standardCircleGroup);
+    standardCircleVerticalFovSpin_->setRange(0.001, 100000.0);
+    standardCircleVerticalFovSpin_->setDecimals(3);
+    standardCircleVerticalFovSpin_->setValue(30.0);
+    standardCircleVerticalFovSpin_->setSuffix(QStringLiteral(" mm"));
+
+    standardCircleOverlapSpin_ = new QDoubleSpinBox(standardCircleGroup);
+    standardCircleOverlapSpin_->setRange(0.0, 100.0);
+    standardCircleOverlapSpin_->setDecimals(2);
+    standardCircleOverlapSpin_->setValue(70.0);
+    standardCircleOverlapSpin_->setSuffix(QStringLiteral(" %"));
+
+    standardCircleWindowHalfSizeSpin_ = new QDoubleSpinBox(standardCircleGroup);
+    standardCircleWindowHalfSizeSpin_->setRange(1.0, 100000.0);
+    standardCircleWindowHalfSizeSpin_->setDecimals(1);
+    standardCircleWindowHalfSizeSpin_->setValue(60.0);
+    standardCircleWindowHalfSizeSpin_->setSuffix(QStringLiteral(" px"));
+
+    standardCircleMedianRadiusSpin_ = new QSpinBox(standardCircleGroup);
+    standardCircleMedianRadiusSpin_->setRange(0, 99);
+    standardCircleMedianRadiusSpin_->setValue(10);
+
+    standardCircleFilterBlendSpin_ = new QDoubleSpinBox(standardCircleGroup);
+    standardCircleFilterBlendSpin_->setRange(0.0, 1.0);
+    standardCircleFilterBlendSpin_->setDecimals(3);
+    standardCircleFilterBlendSpin_->setSingleStep(0.005);
+    standardCircleFilterBlendSpin_->setValue(0.950);
+
+    standardCircleForm->addRow(QStringLiteral("文件前缀"), standardCirclePrefixEdit_);
+    standardCircleForm->addRow(QStringLiteral("文件后缀"), standardCircleExtensionEdit_);
+    standardCircleForm->addRow(QStringLiteral("起始序号"), standardCircleStartIndexSpin_);
+    standardCircleForm->addRow(QStringLiteral("标准圆直径"), standardCircleDiameterSpin_);
+    standardCircleForm->addRow(QStringLiteral("水平视场"), standardCircleHorizontalFovSpin_);
+    standardCircleForm->addRow(QStringLiteral("垂直视场"), standardCircleVerticalFovSpin_);
+    standardCircleForm->addRow(QStringLiteral("采集重叠率"), standardCircleOverlapSpin_);
+    standardCircleForm->addRow(QStringLiteral("测量窗口半尺寸"), standardCircleWindowHalfSizeSpin_);
+    standardCircleForm->addRow(QStringLiteral("环向中值半径"), standardCircleMedianRadiusSpin_);
+    standardCircleForm->addRow(QStringLiteral("滤波混合系数"), standardCircleFilterBlendSpin_);
+    standardCircleLayout->addLayout(standardCircleForm);
+
+    standardCircleRunButton_ = new QPushButton(QStringLiteral("运行标准圆检测"), standardCircleGroup);
+    standardCircleRunButton_->setObjectName(QStringLiteral("successActionButton"));
+    standardCircleRunButton_->setMinimumHeight(28);
+    standardCircleLayout->addWidget(standardCircleRunButton_);
+
+    standardCircleSectionContainer_ =
+        makeCollapsibleSection(QStringLiteral("标准圆检测"), standardCircleGroup, false, registrationSection_);
+    registrationLayout->addWidget(standardCircleSectionContainer_);
     registrationLayout->addStretch(1);
 
     reportSection_ = makeSectionPanel(QStringLiteral("reportConfigSection"), this);
@@ -492,6 +576,11 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     connect(cameraCaptureButton_, &QPushButton::clicked, this, [this]() {
         startCameraCapture();
     });
+    connect(standardCircleRunButton_, &QPushButton::clicked, this, [this]() {
+        setStandardCircleModeEnabled(true);
+        revealStandardCircleConfig();
+        emit standardCircleRunRequested();
+    });
 
     connectChangeSignals();
     updateDetectedCount();
@@ -537,16 +626,73 @@ bool RunConfigPanel::buildRequest(pinjie::StitchRunRequest& request,
     }
 
     request = {};
-    request.imagePaths.reserve(static_cast<std::size_t>(useCount));
-    for (int i = 0; i < useCount; ++i) {
-        request.imagePaths.push_back(QDir::fromNativeSeparators(imagePaths.at(i)).toUtf8().toStdString());
-    }
-
-    const double overlapRatio = overlapSpin_->value() / 100.0;
     const QString suffix =
         runNameEdit_->text().trimmed().isEmpty()
             ? QStringLiteral("workpiece_gui")
             : runNameEdit_->text().trimmed();
+    const bool standardCircleMode = standardCircleModeEnabled();
+
+    if (standardCircleMode) {
+        const QString prefix =
+            standardCirclePrefixEdit_ ? standardCirclePrefixEdit_->text().trimmed() : QStringLiteral("Pic_");
+        QString extension =
+            standardCircleExtensionEdit_ ? standardCircleExtensionEdit_->text().trimmed() : QStringLiteral(".bmp");
+        if (prefix.isEmpty()) {
+            errorMessage = QStringLiteral("标准圆检测模式需要有效的文件前缀。");
+            return false;
+        }
+        if (extension.isEmpty()) {
+            errorMessage = QStringLiteral("标准圆检测模式需要有效的文件后缀。");
+            return false;
+        }
+        if (!extension.startsWith('.')) {
+            extension.prepend('.');
+        }
+
+        const int startIndex =
+            standardCircleStartIndexSpin_ ? standardCircleStartIndexSpin_->value() : 1;
+        request.imagePaths.reserve(static_cast<std::size_t>(useCount));
+        for (int i = 0; i < useCount; ++i) {
+            const QString fileName = QStringLiteral("%1%2%3")
+                                         .arg(prefix)
+                                         .arg(startIndex + i)
+                                         .arg(extension);
+            const QString absolutePath = dir.absoluteFilePath(fileName);
+            if (!QFileInfo::exists(absolutePath)) {
+                errorMessage = QStringLiteral("标准圆序列文件不存在：%1")
+                                   .arg(QDir::toNativeSeparators(absolutePath));
+                return false;
+            }
+            request.imagePaths.push_back(QDir::fromNativeSeparators(absolutePath).toUtf8().toStdString());
+        }
+
+        request.standardCircleConfig.enabled = true;
+        request.standardCircleConfig.startIndex = startIndex;
+        request.standardCircleConfig.imagePrefix = prefix.toUtf8().toStdString();
+        request.standardCircleConfig.imageExtension = extension.toUtf8().toStdString();
+        request.standardCircleConfig.sphereDiameterMm =
+            standardCircleDiameterSpin_ ? standardCircleDiameterSpin_->value() : 19.99995;
+        request.standardCircleConfig.horizontalFieldOfViewMm =
+            standardCircleHorizontalFovSpin_ ? standardCircleHorizontalFovSpin_->value() : 40.0;
+        request.standardCircleConfig.verticalFieldOfViewMm =
+            standardCircleVerticalFovSpin_ ? standardCircleVerticalFovSpin_->value() : 30.0;
+        request.standardCircleConfig.overlapRatio =
+            standardCircleOverlapSpin_ ? standardCircleOverlapSpin_->value() / 100.0 : 0.70;
+        request.standardCircleConfig.windowHalfSizePx =
+            standardCircleWindowHalfSizeSpin_ ? standardCircleWindowHalfSizeSpin_->value() : 60.0;
+        request.standardCircleConfig.windowHalfAngleDeg = 7.0;
+        request.standardCircleConfig.circularMedianFilterRadius =
+            standardCircleMedianRadiusSpin_ ? standardCircleMedianRadiusSpin_->value() : 10;
+        request.standardCircleConfig.circularFilterBlend =
+            standardCircleFilterBlendSpin_ ? standardCircleFilterBlendSpin_->value() : 0.95;
+    } else {
+        request.imagePaths.reserve(static_cast<std::size_t>(useCount));
+        for (int i = 0; i < useCount; ++i) {
+            request.imagePaths.push_back(QDir::fromNativeSeparators(imagePaths.at(i)).toUtf8().toStdString());
+        }
+    }
+
+    const double overlapRatio = overlapSpin_->value() / 100.0;
 
     request.edgeConfig.cannyLow = cannyLowSpin_->value();
     request.edgeConfig.cannyHigh = cannyHighSpin_->value();
@@ -580,7 +726,7 @@ bool RunConfigPanel::buildRequest(pinjie::StitchRunRequest& request,
         return true;
     }
 
-    const std::string resultCategory = "workpiece";
+    const std::string resultCategory = standardCircleMode ? "standard_sphere_loop" : "workpiece";
     const pinjie::StitchResultPathSet resultPaths =
         pinjie::buildDefaultStitchResultPaths(suffix.toUtf8().toStdString(), resultCategory, saveDebugCheck_->isChecked());
     if (!pinjie::ensureStitchResultDirectories(resultPaths)) {
@@ -589,34 +735,54 @@ bool RunConfigPanel::buildRequest(pinjie::StitchRunRequest& request,
     }
 
     request.resultOutputDir = pinjie::genericUtf8String(resultPaths.runDir);
-    request.panoramaOutputPath = pinjie::genericUtf8String(resultPaths.panoramaPath);
-    request.csvOutputPath = pinjie::genericUtf8String(resultPaths.csvPath);
-    request.designErrorProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.designErrorProfileCsvPath);
-    request.designErrorSummaryCsvOutputPath = pinjie::genericUtf8String(resultPaths.designErrorSummaryCsvPath);
-    request.designComparisonOverlayOutputPath =
-        pinjie::genericUtf8String(resultPaths.designComparisonOverlayPath);
-    request.qualityReviewCsvOutputPath = pinjie::genericUtf8String(resultPaths.qualityReviewCsvPath);
-    request.contourPointsCsvOutputPath = pinjie::genericUtf8String(resultPaths.contourPointsCsvPath);
-    request.originContourOverlayCsvOutputPath = pinjie::genericUtf8String(resultPaths.originContourOverlayCsvPath);
-    request.stitchedContourProfileCsvOutputPath =
-        pinjie::genericUtf8String(resultPaths.stitchedContourProfileCsvPath);
-    request.tangentStepCsvOutputPath = pinjie::genericUtf8String(resultPaths.tangentStepCsvPath);
-    request.normalErrorProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.normalErrorProfileCsvPath);
-    request.tangentProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.tangentProfileCsvPath);
-    request.originTangentPointMetricsCsvOutputPath =
-        pinjie::genericUtf8String(resultPaths.originTangentPointMetricsCsvPath);
-    if (saveAlignmentCandidateDiagnosticsCsv()) {
+    if (standardCircleMode) {
+        const auto runDir = resultPaths.runDir;
+        request.panoramaOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_gbt57_p2d_window_overlay.png");
+        request.csvOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_gbt57_p2d_summary.csv");
+        request.designComparisonOverlayOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_gbt57_p2d_edge_overlay.png");
+        request.qualityReviewCsvOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_gbt57_p2d_candidate_coverage.csv");
+        request.contourPointsCsvOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_gbt57_p2d_points.csv");
         request.alignmentCandidateDiagnosticsCsvOutputPath =
-            pinjie::genericUtf8String(resultPaths.alignmentCandidateDiagnosticsCsvPath);
-    }
-    request.contourOverlayOutputPath = pinjie::genericUtf8String(resultPaths.contourOverlayPath);
-    request.stitchedContourProfilePlotOutputPath =
-        pinjie::genericUtf8String(resultPaths.stitchedContourProfilePlotPath);
-    request.tangentCorrelationAllOutputPath = pinjie::genericUtf8String(resultPaths.tangentCorrelationAllPath);
-    request.tangentCorrelationInlierOutputPath =
-        pinjie::genericUtf8String(resultPaths.tangentCorrelationInlierPath);
-    if (saveDebugCheck_->isChecked()) {
-        request.debugImageOutputDir = pinjie::genericUtf8String(resultPaths.debugDir);
+            pinjie::genericUtf8String(runDir / "standard_sphere_circle_edge_cleanup.csv");
+        request.designErrorProfileCsvOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_dominant_dark_component_mask.csv");
+        request.designErrorSummaryCsvOutputPath =
+            pinjie::genericUtf8String(runDir / "standard_sphere_support_change_mask.csv");
+    } else {
+        request.panoramaOutputPath = pinjie::genericUtf8String(resultPaths.panoramaPath);
+        request.csvOutputPath = pinjie::genericUtf8String(resultPaths.csvPath);
+        request.designErrorProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.designErrorProfileCsvPath);
+        request.designErrorSummaryCsvOutputPath = pinjie::genericUtf8String(resultPaths.designErrorSummaryCsvPath);
+        request.designComparisonOverlayOutputPath =
+            pinjie::genericUtf8String(resultPaths.designComparisonOverlayPath);
+        request.qualityReviewCsvOutputPath = pinjie::genericUtf8String(resultPaths.qualityReviewCsvPath);
+        request.contourPointsCsvOutputPath = pinjie::genericUtf8String(resultPaths.contourPointsCsvPath);
+        request.originContourOverlayCsvOutputPath = pinjie::genericUtf8String(resultPaths.originContourOverlayCsvPath);
+        request.stitchedContourProfileCsvOutputPath =
+            pinjie::genericUtf8String(resultPaths.stitchedContourProfileCsvPath);
+        request.tangentStepCsvOutputPath = pinjie::genericUtf8String(resultPaths.tangentStepCsvPath);
+        request.normalErrorProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.normalErrorProfileCsvPath);
+        request.tangentProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.tangentProfileCsvPath);
+        request.originTangentPointMetricsCsvOutputPath =
+            pinjie::genericUtf8String(resultPaths.originTangentPointMetricsCsvPath);
+        if (saveAlignmentCandidateDiagnosticsCsv()) {
+            request.alignmentCandidateDiagnosticsCsvOutputPath =
+                pinjie::genericUtf8String(resultPaths.alignmentCandidateDiagnosticsCsvPath);
+        }
+        request.contourOverlayOutputPath = pinjie::genericUtf8String(resultPaths.contourOverlayPath);
+        request.stitchedContourProfilePlotOutputPath =
+            pinjie::genericUtf8String(resultPaths.stitchedContourProfilePlotPath);
+        request.tangentCorrelationAllOutputPath = pinjie::genericUtf8String(resultPaths.tangentCorrelationAllPath);
+        request.tangentCorrelationInlierOutputPath =
+            pinjie::genericUtf8String(resultPaths.tangentCorrelationInlierPath);
+        if (saveDebugCheck_->isChecked()) {
+            request.debugImageOutputDir = pinjie::genericUtf8String(resultPaths.debugDir);
+        }
     }
 
     return true;
@@ -682,6 +848,30 @@ bool RunConfigPanel::saveAlignmentCandidateDiagnosticsCsv() const
 {
     return saveAlignmentCandidateDiagnosticsCsvCheck_ &&
            saveAlignmentCandidateDiagnosticsCsvCheck_->isChecked();
+}
+
+bool RunConfigPanel::standardCircleModeEnabled() const
+{
+    return standardCircleCheck_ && standardCircleCheck_->isChecked();
+}
+
+void RunConfigPanel::setStandardCircleModeEnabled(const bool enabled)
+{
+    if (!standardCircleCheck_ || standardCircleCheck_->isChecked() == enabled) {
+        return;
+    }
+    standardCircleCheck_->setChecked(enabled);
+}
+
+void RunConfigPanel::revealStandardCircleConfig()
+{
+    if (!standardCircleSectionContainer_) {
+        return;
+    }
+    if (auto* toggleButton =
+            standardCircleSectionContainer_->findChild<QToolButton*>(QStringLiteral("configSectionToggle"))) {
+        toggleButton->setChecked(true);
+    }
 }
 
 QWidget* RunConfigPanel::acquisitionSection() const
@@ -1363,6 +1553,47 @@ void RunConfigPanel::connectChangeSignals()
             this,
             &RunConfigPanel::configChanged);
     connect(tangentCorrelationWeightSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleCheck_, &QCheckBox::checkStateChanged, this, [this](Qt::CheckState) {
+        emit configChanged();
+    });
+    connect(standardCirclePrefixEdit_, &QLineEdit::textChanged, this, [this](const QString&) {
+        emit configChanged();
+    });
+    connect(standardCircleExtensionEdit_, &QLineEdit::textChanged, this, [this](const QString&) {
+        emit configChanged();
+    });
+    connect(standardCircleStartIndexSpin_,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleDiameterSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleHorizontalFovSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleVerticalFovSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleOverlapSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleWindowHalfSizeSpin_,
+            qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleMedianRadiusSpin_,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            &RunConfigPanel::configChanged);
+    connect(standardCircleFilterBlendSpin_,
             qOverload<double>(&QDoubleSpinBox::valueChanged),
             this,
             &RunConfigPanel::configChanged);

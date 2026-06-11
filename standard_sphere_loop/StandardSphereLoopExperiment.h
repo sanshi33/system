@@ -64,6 +64,7 @@ struct StandardSphereLoopConfig {
     stitch::StitchPipelineConfig pipelineConfig{};
     double pixelSizeMm{0.0};
     double sphereDiameterMm{0.0};
+    int sphereDiameterDecimalPlaces{4};
     bool useClockwiseLoopPath{true};
     double horizontalFieldOfViewMm{40.0};
     double verticalFieldOfViewMm{30.0};

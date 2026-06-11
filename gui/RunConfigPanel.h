@@ -42,6 +42,9 @@ public:
     bool saveNormalErrorProfileCsv() const;
     bool saveTangentProfileCsv() const;
     bool saveAlignmentCandidateDiagnosticsCsv() const;
+    bool standardCircleModeEnabled() const;
+    void setStandardCircleModeEnabled(bool enabled);
+    void revealStandardCircleConfig();
 
     QWidget* acquisitionSection() const;
     QWidget* processingSection() const;
@@ -51,6 +54,7 @@ public:
 signals:
     void configChanged();
     void cameraPreviewUpdated(const QImage& image, const QString& summary);
+    void standardCircleRunRequested();
 
 private:
     QStringList scanImagePaths() const;
@@ -77,6 +81,7 @@ private:
     QWidget* processingSection_{nullptr};
     QWidget* registrationSection_{nullptr};
     QWidget* reportSection_{nullptr};
+    QWidget* standardCircleSectionContainer_{nullptr};
 
     QComboBox* captureModeCombo_{nullptr};
     QLineEdit* inputDirEdit_{nullptr};
@@ -127,6 +132,18 @@ private:
     QDoubleSpinBox* rotationStepSpin_{nullptr};
     QDoubleSpinBox* tangentResidualWeightSpin_{nullptr};
     QDoubleSpinBox* tangentCorrelationWeightSpin_{nullptr};
+    QCheckBox* standardCircleCheck_{nullptr};
+    QLineEdit* standardCirclePrefixEdit_{nullptr};
+    QLineEdit* standardCircleExtensionEdit_{nullptr};
+    QSpinBox* standardCircleStartIndexSpin_{nullptr};
+    QDoubleSpinBox* standardCircleDiameterSpin_{nullptr};
+    QDoubleSpinBox* standardCircleHorizontalFovSpin_{nullptr};
+    QDoubleSpinBox* standardCircleVerticalFovSpin_{nullptr};
+    QDoubleSpinBox* standardCircleOverlapSpin_{nullptr};
+    QDoubleSpinBox* standardCircleWindowHalfSizeSpin_{nullptr};
+    QSpinBox* standardCircleMedianRadiusSpin_{nullptr};
+    QDoubleSpinBox* standardCircleFilterBlendSpin_{nullptr};
+    QPushButton* standardCircleRunButton_{nullptr};
 
     QLineEdit* runNameEdit_{nullptr};
     QCheckBox* saveDebugCheck_{nullptr};

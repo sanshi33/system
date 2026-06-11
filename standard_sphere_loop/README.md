@@ -15,8 +15,16 @@ standard_sphere_loop_eval
 ## 基本用法
 
 ```bash
-standard_sphere_loop_eval <标准球图像目录> <图像数量> --start-index 1 --pixel-size 0.010057 --sphere-diameter 5.9989
+standard_sphere_loop_eval <标准球图像目录> <图像数量> --start-index 1 --sphere-diameter 59.9986
 ```
+
+在 `GB/T 5.7` 的 25 点单点评定模式下，如果提供了 `--sphere-diameter`，
+程序会优先使用“实际球径 / 拼接全局圆直径”反算像素当量，再换算 `e_p2d`、`RMSE`
+等微米指标；只有在没有可用球径时，才回退到 `--pixel-size` 或视场配置推导的比例尺。
+
+如果需要在不破坏稳定拼接结果的前提下，尽量把被圆边清理删掉的边缘点也纳入 25 点候选，
+可以额外打开 `--gbt57-supplement-precleanup-candidates`。这个模式会保留“清理后边缘”用于
+全局拼接与全局圆拟合，但在单点候选池里补回清理前的边缘点，用于评估现有数据的极限覆盖能力。
 
 默认按 `Pic_1.bmp, Pic_2.bmp ...` 读取。若文件命名不同，可以用：
 

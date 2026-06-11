@@ -21,6 +21,7 @@
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QProgressBar>
+#include <QRegularExpression>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSplitter>
@@ -61,6 +62,93 @@ constexpr int kRegistrationViewTabsMinimumHeight = 320;
 constexpr int kRegistrationContentTopDefaultHeight = 620;
 constexpr int kRegistrationContentBottomDefaultHeight = 170;
 constexpr int kSidebarSummaryMaximumHeight = 76;
+constexpr int kReportPanoramaTabIndex = 0;
+constexpr int kReportSecondaryImageTabIndex = 1;
+constexpr int kBottomSummaryTabIndex = 0;
+constexpr int kBottomCoverageTabIndex = 1;
+constexpr int kBottomPointDetailTabIndex = 2;
+constexpr int kBottomDiagnosticTabIndex = 3;
+constexpr int kBottomCsvTabIndex = 4;
+
+bool isStandardCircleMode(const pinjie::StitchRunRequest& request)
+{
+    return request.standardCircleConfig.enabled;
+}
+
+QString metricKey(const QString& metric, const QString& unit)
+{
+    return metric + QStringLiteral("|") + unit;
+}
+
+QHash<QString, QString> parseMetricCsvByKey(const QString& csvText)
+{
+    QHash<QString, QString> metrics;
+    const QString normalized = csvText;
+    const QStringList lines = normalized.split(QRegularExpression(QStringLiteral("[\r\n]+")),
+                                               Qt::SkipEmptyParts);
+    for (int i = 1; i < lines.size(); ++i) {
+        const QString& line = lines.at(i);
+        const int firstComma = line.indexOf(',');
+        if (firstComma < 0) {
+            continue;
+        }
+        const int secondComma = line.indexOf(',', firstComma + 1);
+        if (secondComma < 0) {
+            continue;
+        }
+        const int thirdComma = line.indexOf(',', secondComma + 1);
+        if (thirdComma < 0) {
+            continue;
+        }
+
+        const QString metric = line.left(firstComma).trimmed();
+        const QString value =
+            line.mid(firstComma + 1, secondComma - firstComma - 1).trimmed();
+        const QString unit =
+            line.mid(secondComma + 1, thirdComma - secondComma - 1).trimmed();
+        if (!metric.isEmpty()) {
+            metrics.insert(metricKey(metric, unit), value);
+            if (!metrics.contains(metricKey(metric, QString()))) {
+                metrics.insert(metricKey(metric, QString()), value);
+            }
+        }
+    }
+    return metrics;
+}
+
+QString metricValue(const QHash<QString, QString>& metrics,
+                    const QString& metric,
+                    const QString& unit = QString())
+{
+    return metrics.value(metricKey(metric, unit));
+}
+
+void setReportTabTexts(QTabWidget* reportTabs, QTabWidget* bottomTabs, const bool standardCircleMode)
+{
+    if (reportTabs) {
+        reportTabs->setTabText(kReportPanoramaTabIndex,
+                               standardCircleMode ? QStringLiteral("测量窗口图")
+                                                  : QStringLiteral("全景结果"));
+        reportTabs->setTabText(kReportSecondaryImageTabIndex,
+                               standardCircleMode ? QStringLiteral("边缘叠加图")
+                                                  : QStringLiteral("设计比对图"));
+    }
+    if (bottomTabs) {
+        bottomTabs->setTabText(kBottomSummaryTabIndex, QStringLiteral("摘要"));
+        bottomTabs->setTabText(kBottomCoverageTabIndex,
+                               standardCircleMode ? QStringLiteral("候选覆盖")
+                                                  : QStringLiteral("质量审查"));
+        bottomTabs->setTabText(kBottomPointDetailTabIndex,
+                               standardCircleMode ? QStringLiteral("25点详情")
+                                                  : QStringLiteral("设计比对"));
+        bottomTabs->setTabText(kBottomDiagnosticTabIndex,
+                               standardCircleMode ? QStringLiteral("掩模诊断")
+                                                  : QStringLiteral("候选诊断"));
+        bottomTabs->setTabText(kBottomCsvTabIndex,
+                               standardCircleMode ? QStringLiteral("摘要 CSV")
+                                                  : QStringLiteral("CSV 数据"));
+    }
+}
 
 void configureStageSidebar(QWidget* sidebar)
 {
@@ -89,6 +177,9 @@ QString stageLabel(const QString& stage)
     }
     if (stage == QStringLiteral("stitch")) {
         return QStringLiteral("拼接");
+    }
+    if (stage == QStringLiteral("report")) {
+        return QStringLiteral("结果导出");
     }
     return stage;
 }
@@ -247,6 +338,9 @@ bool samePipelineConfig(const stitch::StitchPipelineConfig& lhs, const stitch::S
 bool canReuseOutputPaths(const pinjie::StitchRunRequest& previousRequest,
                          const pinjie::StitchRunRequest& currentRequest)
 {
+    if (isStandardCircleMode(previousRequest) || isStandardCircleMode(currentRequest)) {
+        return false;
+    }
     return !previousRequest.resultOutputDir.empty() &&
            previousRequest.imagePaths == currentRequest.imagePaths &&
            sameEdgeConfig(previousRequest.edgeConfig, currentRequest.edgeConfig) &&
@@ -296,6 +390,17 @@ QString readUtf8TextFile(const std::string& path)
     std::string content((std::istreambuf_iterator<char>(stream)),
                         std::istreambuf_iterator<char>());
     return QString::fromUtf8(content.data(), static_cast<int>(content.size()));
+}
+
+std::string standardCircleRadiiCsvOutputPath(const pinjie::StitchRunRequest& request)
+{
+    if (request.resultOutputDir.empty()) {
+        return {};
+    }
+
+    const std::filesystem::path path =
+        std::filesystem::u8path(request.resultOutputDir) / "standard_sphere_gbt57_p2d_radii.csv";
+    return path.u8string();
 }
 
 QString publicationFigurePngPath(const pinjie::StitchRunRequest& request)
@@ -433,27 +538,28 @@ QStringList selectedPaperCsvLabels(const RunConfigPanel* configPanel)
         return {};
     }
 
+    const bool standardCircleMode = configPanel->standardCircleModeEnabled();
     QStringList labels;
     if (configPanel->saveStepSummaryCsv()) {
-        labels << QStringLiteral("拼接汇总");
+        labels << (standardCircleMode ? QStringLiteral("国标摘要") : QStringLiteral("拼接汇总"));
     }
     if (configPanel->saveContourPointsCsv()) {
-        labels << QStringLiteral("轮廓叠加点");
+        labels << (standardCircleMode ? QStringLiteral("25点详情") : QStringLiteral("轮廓叠加点"));
     }
     if (configPanel->saveStitchedContourProfileCsv()) {
-        labels << QStringLiteral("整体轮廓剖面");
+        labels << (standardCircleMode ? QStringLiteral("窗口图像") : QStringLiteral("整体轮廓剖面"));
     }
     if (configPanel->saveTangentStepCsv()) {
-        labels << QStringLiteral("切向相关性");
+        labels << (standardCircleMode ? QStringLiteral("边缘叠加") : QStringLiteral("切向相关性"));
     }
     if (configPanel->saveNormalErrorProfileCsv()) {
-        labels << QStringLiteral("法向误差剖面");
+        labels << (standardCircleMode ? QStringLiteral("主暗区掩模") : QStringLiteral("法向误差剖面"));
     }
     if (configPanel->saveTangentProfileCsv()) {
-        labels << QStringLiteral("轮廓波动分析");
+        labels << (standardCircleMode ? QStringLiteral("支撑差异掩模") : QStringLiteral("轮廓波动分析"));
     }
     if (configPanel->saveAlignmentCandidateDiagnosticsCsv()) {
-        labels << QStringLiteral("候选诊断");
+        labels << (standardCircleMode ? QStringLiteral("圆边清理诊断") : QStringLiteral("候选诊断"));
     }
     return labels;
 }
@@ -925,6 +1031,15 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(startButton_, &QPushButton::clicked, this, [this]() { startRun(); });
     connect(moduleRunButton_, &QPushButton::clicked, this, [this]() { startCurrentModuleRun(); });
+    connect(configPanel_, &RunConfigPanel::standardCircleRunRequested, this, [this]() {
+        if (!configPanel_) {
+            return;
+        }
+        configPanel_->setStandardCircleModeEnabled(true);
+        switchToStage(RegistrationStage);
+        configPanel_->revealStandardCircleConfig();
+        startRun(pinjie::StitchRunMode::Full);
+    });
     connect(stopButton_, &QPushButton::clicked, this, [this]() { stopRun(); });
     connect(focusWorstStepButton_, &QPushButton::clicked, this, [this]() { jumpToWorstStep(); });
     connect(focusNextRiskStepButton_, &QPushButton::clicked, this, [this]() { jumpToNextRiskStep(); });
@@ -1060,14 +1175,6 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
         return;
     }
 
-    if (!hasActiveCalibration()) {
-        QMessageBox::information(this,
-                                 QStringLiteral("需要标定"),
-                                 QStringLiteral("请先加载有效的标定结果，再运行当前阶段。"));
-        switchToStage(CalibrationStage);
-        return;
-    }
-
     pinjie::StitchRunRequest request;
     QString errorMessage;
     if (!configPanel_->buildRequest(request, errorMessage, false)) {
@@ -1076,7 +1183,20 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
         return;
     }
 
+    const bool standardCircleMode = isStandardCircleMode(request);
+    if (!standardCircleMode && !hasActiveCalibration()) {
+        QMessageBox::information(this,
+                                 QStringLiteral("需要标定"),
+                                 QStringLiteral("请先加载有效的标定结果，再运行当前阶段。"));
+        switchToStage(CalibrationStage);
+        return;
+    }
+    if (standardCircleMode) {
+        runMode = pinjie::StitchRunMode::Full;
+    }
+
     const bool reusePreviousOutputPaths =
+        !standardCircleMode &&
         runMode != pinjie::StitchRunMode::Full &&
         runMode != pinjie::StitchRunMode::Acquisition &&
         runCache_ &&
@@ -1089,10 +1209,13 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
         return;
     }
 
-    request.previousCache = runCache_;
+    request.previousCache = standardCircleMode ? pinjie::StitchRunCachePtr() : runCache_;
     lastRequest_ = request;
     currentRunMode_ = runMode;
     currentTaskSupportsStop_ = true;
+    if (standardCircleMode) {
+        runCache_.reset();
+    }
     completedSteps_.clear();
     stepModel_->clear();
     preprocessImages_.clear();
@@ -1118,6 +1241,7 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
     csvEdit_->clear();
     logEdit_->clear();
     resetReportMetricCards();
+    setReportTabTexts(reportViewTabs_, bottomTabs_, standardCircleMode);
     progressBar_->setRange(0, 100);
     progressBar_->setValue(0);
     progressBar_->setFormat(QStringLiteral("处理中..."));
@@ -1260,6 +1384,8 @@ void MainWindow::onProgress(const QString& stage, int current, int total)
         switchToStage(ProcessingStage);
     } else if (stage == QStringLiteral("stitch")) {
         switchToStage(RegistrationStage);
+    } else if (stage == QStringLiteral("report")) {
+        switchToStage(ReportStage);
     }
 
     statusBar()->showMessage(QStringLiteral("%1 %2/%3").arg(stageLabel(stage)).arg(current).arg(total));
@@ -1355,9 +1481,14 @@ void MainWindow::onRunFinished(bool ok,
     const pinjie::cad_design::DesignErrorSummary* designSummaryPtr = nullptr;
     pinjie::cad_design::DesignAlignmentResult designAlignmentResult;
     QStringList designCompareLines;
+    const bool standardCircleMode = isStandardCircleMode(lastRequest_);
 
-    if (cache && (cache->hasLoadedImages() || cache->hasPreprocessedEdges() || cache->hasStitching())) {
+    if (!standardCircleMode &&
+        cache &&
+        (cache->hasLoadedImages() || cache->hasPreprocessedEdges() || cache->hasStitching())) {
         runCache_ = std::move(cache);
+    } else if (standardCircleMode) {
+        runCache_.reset();
     }
 
     if (completedSteps_.empty() && runCache_ && runCache_->hasStitching()) {
@@ -1376,6 +1507,188 @@ void MainWindow::onRunFinished(bool ok,
                  : QStringLiteral("[错误] %1失败").arg(runModeLabel(currentRunMode_)));
     if (!message.isEmpty()) {
         appendLog(message);
+    }
+
+    if (standardCircleMode) {
+        setReportTabTexts(reportViewTabs_, bottomTabs_, true);
+        completedSteps_.clear();
+        if (stepModel_) {
+            stepModel_->clear();
+        }
+
+        if (panorama.isNull() && !lastRequest_.panoramaOutputPath.empty()) {
+            const QImage panoramaFromFile(displayOutputPath(lastRequest_.panoramaOutputPath));
+            if (!panoramaFromFile.isNull()) {
+                panoramaViewer_->setImage(panoramaFromFile);
+            }
+        }
+        if (designCompareViewer_) {
+            const QImage edgeOverlay(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+            if (!edgeOverlay.isNull()) {
+                designCompareViewer_->setImage(edgeOverlay);
+            } else {
+                designCompareViewer_->clearImage();
+            }
+        }
+        if (publicationFigureViewer_) {
+            publicationFigureViewer_->clearImage();
+        }
+
+        const QString summaryCsv = readUtf8TextFile(lastRequest_.csvOutputPath);
+        const QString coverageCsv = readUtf8TextFile(lastRequest_.qualityReviewCsvOutputPath);
+        const QString pointCsv = readUtf8TextFile(lastRequest_.contourPointsCsvOutputPath);
+        const QString radiiCsv = readUtf8TextFile(standardCircleRadiiCsvOutputPath(lastRequest_));
+        const QString edgeCleanupCsv =
+            readUtf8TextFile(lastRequest_.alignmentCandidateDiagnosticsCsvOutputPath);
+        const QString dominantMaskCsv = readUtf8TextFile(lastRequest_.designErrorProfileCsvOutputPath);
+        const QString supportMaskCsv = readUtf8TextFile(lastRequest_.designErrorSummaryCsvOutputPath);
+        const QString summaryText = summaryCsv.isEmpty() ? csvText : summaryCsv;
+        const QHash<QString, QString> metrics = parseMetricCsvByKey(summaryText);
+
+        csvEdit_->setPlainText(summaryText.isEmpty() ? QStringLiteral("本次运行未生成国标摘要 CSV。")
+                                                     : summaryText);
+        if (qualityReviewEdit_) {
+            qualityReviewEdit_->setPlainText(
+                coverageCsv.isEmpty() ? QStringLiteral("本次运行未生成候选覆盖统计。") : coverageCsv);
+        }
+        if (designCompareEdit_) {
+            QStringList detailSections;
+            if (!radiiCsv.trimmed().isEmpty()) {
+                detailSections << QStringLiteral("25点半径结果") << radiiCsv.trimmed();
+            }
+            if (!pointCsv.trimmed().isEmpty()) {
+                detailSections << QStringLiteral("25点完整详情") << pointCsv.trimmed();
+            }
+            designCompareEdit_->setPlainText(
+                detailSections.isEmpty() ? QStringLiteral("本次运行未生成 25 点详情。")
+                                         : detailSections.join(QStringLiteral("\n\n")));
+        }
+        if (candidateDiagnosticsEdit_) {
+            QStringList diagnostics;
+            if (!edgeCleanupCsv.trimmed().isEmpty()) {
+                diagnostics << QStringLiteral("圆边清理诊断") << edgeCleanupCsv.trimmed();
+            }
+            if (!dominantMaskCsv.trimmed().isEmpty()) {
+                diagnostics << QStringLiteral("主暗区掩模诊断") << dominantMaskCsv.trimmed();
+            }
+            if (!supportMaskCsv.trimmed().isEmpty()) {
+                diagnostics << QStringLiteral("支撑差异掩模诊断") << supportMaskCsv.trimmed();
+            }
+            candidateDiagnosticsEdit_->setPlainText(
+                diagnostics.isEmpty() ? QStringLiteral("本次运行未生成掩模诊断。")
+                                      : diagnostics.join(QStringLiteral("\n\n")));
+        }
+
+        QStringList summaryLines;
+        summaryLines << QStringLiteral("标准圆国标检测结果");
+        summaryLines << QString();
+        summaryLines << QStringLiteral("运行结果：%1").arg(ok ? QStringLiteral("成功") : QStringLiteral("失败"));
+        summaryLines << QStringLiteral("已加载图像：%1").arg(loadedImageCount);
+        summaryLines << QStringLiteral("已预处理图像：%1").arg(preprocessedImageCount);
+        if (!lastRequest_.resultOutputDir.empty()) {
+            summaryLines << QStringLiteral("结果目录：%1")
+                                .arg(QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.resultOutputDir)));
+        }
+        if (!message.isEmpty()) {
+            summaryLines << QStringLiteral("运行消息：%1").arg(message);
+        }
+        const auto appendMetricLine =
+            [&summaryLines](const QString& label, const QString& value, const QString& suffix = QString()) {
+                if (!value.isEmpty()) {
+                    summaryLines << QStringLiteral("%1：%2%3").arg(label, value, suffix);
+                }
+            };
+        appendMetricLine(QStringLiteral("E_P2D"), metricValue(metrics, QStringLiteral("e_p2d"), QStringLiteral("um")), QStringLiteral(" um"));
+        appendMetricLine(QStringLiteral("单点 RMSE"),
+                         metricValue(metrics, QStringLiteral("single_point_rmse"), QStringLiteral("um")),
+                         QStringLiteral(" um"));
+        appendMetricLine(QStringLiteral("像素当量"),
+                         metricValue(metrics, QStringLiteral("pixel_size"), QStringLiteral("um/px")),
+                         QStringLiteral(" um/px"));
+        appendMetricLine(QStringLiteral("25 点数量"),
+                         metricValue(metrics, QStringLiteral("selected_point_count"), QStringLiteral("count")));
+        appendMetricLine(QStringLiteral("窗口在图内数量"),
+                         metricValue(metrics,
+                                     QStringLiteral("measurement_window_inside_image_count"),
+                                     QStringLiteral("count")));
+        appendMetricLine(QStringLiteral("窗口重叠数量"),
+                         metricValue(metrics,
+                                     QStringLiteral("measurement_window_overlap_count"),
+                                     QStringLiteral("count")));
+        appendMetricLine(QStringLiteral("窗口越界数量"),
+                         metricValue(metrics, QStringLiteral("window_violation_count"), QStringLiteral("count")));
+        appendMetricLine(QStringLiteral("目标角最大偏差"),
+                         metricValue(metrics, QStringLiteral("target_angle_delta_max"), QStringLiteral("deg")),
+                         QStringLiteral(" deg"));
+        appendMetricLine(QStringLiteral("角间距最大误差"),
+                         metricValue(metrics, QStringLiteral("angle_spacing_max_error"), QStringLiteral("deg")),
+                         QStringLiteral(" deg"));
+        appendMetricLine(QStringLiteral("全局椭圆轴比"),
+                         metricValue(metrics, QStringLiteral("global_ellipse_axis_ratio"), QStringLiteral("ratio")));
+        if (metricValue(metrics,
+                        QStringLiteral("ellipse_rectified_evaluation_applied"),
+                        QStringLiteral("bool")) == QStringLiteral("1")) {
+            summaryLines << QStringLiteral("椭圆修正：已应用");
+        }
+        if (!lastRequest_.panoramaOutputPath.empty()) {
+            summaryLines << QStringLiteral("测量窗口图：%1")
+                                .arg(QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.panoramaOutputPath)));
+        }
+        if (!lastRequest_.designComparisonOverlayOutputPath.empty()) {
+            summaryLines << QStringLiteral("边缘叠加图：%1")
+                                .arg(QDir::toNativeSeparators(
+                                    fromUtf8StdString(lastRequest_.designComparisonOverlayOutputPath)));
+        }
+        if (!lastRequest_.contourPointsCsvOutputPath.empty()) {
+            summaryLines << QStringLiteral("25 点详情 CSV：%1")
+                                .arg(QDir::toNativeSeparators(
+                                    fromUtf8StdString(lastRequest_.contourPointsCsvOutputPath)));
+        }
+        const std::string radiiCsvPath = standardCircleRadiiCsvOutputPath(lastRequest_);
+        if (!radiiCsvPath.empty()) {
+            summaryLines << QStringLiteral("25 点半径 CSV：%1")
+                                .arg(QDir::toNativeSeparators(fromUtf8StdString(radiiCsvPath)));
+        }
+
+        summaryEdit_->setPlainText(summaryLines.join('\n'));
+        bottomTabs_->setCurrentWidget(summaryEdit_);
+        resetReportMetricCards();
+        if (metricLoadedImagesValue_) {
+            metricLoadedImagesValue_->setText(QString::number(std::max(loadedImageCount, 0)));
+        }
+        if (metricPreprocessedImagesValue_) {
+            metricPreprocessedImagesValue_->setText(QString::number(std::max(preprocessedImageCount, 0)));
+        }
+        if (metricStepCountValue_) {
+            const QString selectedCount =
+                metricValue(metrics, QStringLiteral("selected_point_count"), QStringLiteral("count"));
+            metricStepCountValue_->setText(selectedCount.isEmpty() ? QStringLiteral("0") : selectedCount);
+        }
+        if (metricFlaggedStepsValue_) {
+            const int overlapCount =
+                metricValue(metrics,
+                            QStringLiteral("measurement_window_overlap_count"),
+                            QStringLiteral("count"))
+                    .toInt();
+            const int violationCount =
+                metricValue(metrics, QStringLiteral("window_violation_count"), QStringLiteral("count"))
+                    .toInt();
+            metricFlaggedStepsValue_->setText(QString::number(overlapCount + violationCount));
+        }
+        if (metricDesignUsedCountValue_) {
+            const QString insideCount =
+                metricValue(metrics,
+                            QStringLiteral("measurement_window_inside_image_count"),
+                            QStringLiteral("count"));
+            metricDesignUsedCountValue_->setText(insideCount.isEmpty() ? QStringLiteral("0")
+                                                                       : insideCount);
+        }
+        refreshRegistrationToolState();
+        refreshReportExportState(ok ? QStringLiteral("标准圆结果已生成，所选 CSV 可直接从结果目录查看。")
+                                    : QStringLiteral("标准圆检测失败，请先检查日志和摘要 CSV。"));
+        refreshStageSummaries();
+        switchToStage(ReportStage);
+        return;
     }
 
     csvEdit_->setPlainText(csvText);
@@ -1678,12 +1991,19 @@ void MainWindow::refreshStageSummaries()
     pinjie::StitchRunRequest request;
     QString errorMessage;
     const bool valid = configPanel_->buildRequest(request, errorMessage, false);
+    const bool standardCircleMode = valid && isStandardCircleMode(request);
 
-    if (!hasActiveCalibration()) {
+    if (!hasActiveCalibration() && !standardCircleMode) {
         workflowStateLabel_->setText(QStringLiteral("流程：未加载标定结果，请先完成阶段 1 或加载缓存模型。"));
         registrationPresetLabel_->setText(calibrationConfigValid
                                               ? QStringLiteral("标定：参数已就绪")
                                               : QStringLiteral("标定：参数缺失"));
+    } else if (standardCircleMode && !hasActiveCalibration()) {
+        workflowStateLabel_->setText(
+            valid ? QStringLiteral("流程：标准圆国标检测模式 | %1 张图像待检测 | 无需预先标定")
+                        .arg(request.imagePaths.size())
+                  : QStringLiteral("流程：标准圆国标检测模式 | 运行配置待补充"));
+        registrationPresetLabel_->setText(QStringLiteral("标准圆：掩模板预处理 + 拼接修正 + 椭圆修正 + GB/T 25窗选点"));
     } else {
         workflowStateLabel_->setText(
             valid ? QStringLiteral("流程：%1 | %2 张图像可拼接")
@@ -1735,9 +2055,11 @@ void MainWindow::refreshStageSummaries()
     acquisitionLines << QStringLiteral("配置检查：已就绪");
     acquisitionLines << QString();
     acquisitionLines << QStringLiteral("标定结果：%1")
-                            .arg(hasActiveCalibration()
-                                     ? fromUtf8StdString(activeCalibrationCache_.profile.profileName)
-                                     : QStringLiteral("未加载"));
+                            .arg(standardCircleMode && !hasActiveCalibration()
+                                     ? QStringLiteral("标准圆模式不需要")
+                                     : (hasActiveCalibration()
+                                            ? fromUtf8StdString(activeCalibrationCache_.profile.profileName)
+                                            : QStringLiteral("未加载")));
     acquisitionLines << QStringLiteral("输入图像：%1").arg(request.imagePaths.size());
     if (!request.imagePaths.empty()) {
         acquisitionLines << QStringLiteral("首张图像：%1")
@@ -1766,24 +2088,46 @@ void MainWindow::refreshStageSummaries()
     }
     processingOverviewEdit_->setPlainText(processingLines.join('\n'));
 
-    const auto& pipeline = request.pipelineConfig;
     QStringList registrationLines;
     registrationLines << QStringLiteral("配准参数概览");
     registrationLines << QString();
-    registrationLines << QStringLiteral("方向约束：%1").arg(directionLabel(pipeline.directionConstraint));
-    registrationLines << QStringLiteral("预计重叠率：%1")
-                             .arg(pipeline.expectedOverlapRatio > 0.0
-                                      ? QStringLiteral("%1%").arg(pipeline.expectedOverlapRatio * 100.0, 0, 'f', 2)
-                                      : QStringLiteral("自动估计"));
-    registrationLines << QStringLiteral("基础搜索范围：%1 px").arg(pipeline.baseSearchRange, 0, 'f', 1);
-    registrationLines << QStringLiteral("旋转范围：[%1, %2] deg")
-                             .arg(pipeline.rotationSearchMinDeg, 0, 'f', 2)
-                             .arg(pipeline.rotationSearchMaxDeg, 0, 'f', 2);
-    registrationLines << QStringLiteral("旋转步长：%1 deg").arg(pipeline.rotationSearchStepDeg, 0, 'f', 3);
-    registrationLines << QStringLiteral("切向残差权重：%1").arg(pipeline.tangentResidualCostWeight, 0, 'f', 3);
-    registrationLines << QStringLiteral("切向相关权重：%1").arg(pipeline.tangentCorrelationCostWeight, 0, 'f', 3);
-    registrationLines << QStringLiteral("调试可视化：%1")
-                             .arg(pipeline.generateDebugVisualization ? QStringLiteral("开启") : QStringLiteral("关闭"));
+    if (standardCircleMode) {
+        const auto& standardCircle = request.standardCircleConfig;
+        registrationLines << QStringLiteral("检测模式：标准圆国标 25 视场检测");
+        registrationLines << QStringLiteral("图像序列：%1%2%3 ...")
+                                 .arg(QString::fromStdString(standardCircle.imagePrefix))
+                                 .arg(standardCircle.startIndex)
+                                 .arg(QString::fromStdString(standardCircle.imageExtension));
+        registrationLines << QStringLiteral("标准圆直径：%1 mm").arg(standardCircle.sphereDiameterMm, 0, 'f', 5);
+        registrationLines << QStringLiteral("视场：%1 mm x %2 mm")
+                                 .arg(standardCircle.horizontalFieldOfViewMm, 0, 'f', 3)
+                                 .arg(standardCircle.verticalFieldOfViewMm, 0, 'f', 3);
+        registrationLines << QStringLiteral("采集重叠率：%1%")
+                                 .arg(standardCircle.overlapRatio * 100.0, 0, 'f', 2);
+        registrationLines << QStringLiteral("测量窗口半尺寸：%1 px")
+                                 .arg(standardCircle.windowHalfSizePx, 0, 'f', 1);
+        registrationLines << QStringLiteral("环向中值半径：%1")
+                                 .arg(standardCircle.circularMedianFilterRadius);
+        registrationLines << QStringLiteral("滤波混合系数：%1")
+                                 .arg(standardCircle.circularFilterBlend, 0, 'f', 3);
+        registrationLines << QStringLiteral("流程说明：调用标准圆专用检测链，不使用当前工件设计比对链。");
+    } else {
+        const auto& pipeline = request.pipelineConfig;
+        registrationLines << QStringLiteral("方向约束：%1").arg(directionLabel(pipeline.directionConstraint));
+        registrationLines << QStringLiteral("预计重叠率：%1")
+                                 .arg(pipeline.expectedOverlapRatio > 0.0
+                                          ? QStringLiteral("%1%").arg(pipeline.expectedOverlapRatio * 100.0, 0, 'f', 2)
+                                          : QStringLiteral("自动估计"));
+        registrationLines << QStringLiteral("基础搜索范围：%1 px").arg(pipeline.baseSearchRange, 0, 'f', 1);
+        registrationLines << QStringLiteral("旋转范围：[%1, %2] deg")
+                                 .arg(pipeline.rotationSearchMinDeg, 0, 'f', 2)
+                                 .arg(pipeline.rotationSearchMaxDeg, 0, 'f', 2);
+        registrationLines << QStringLiteral("旋转步长：%1 deg").arg(pipeline.rotationSearchStepDeg, 0, 'f', 3);
+        registrationLines << QStringLiteral("切向残差权重：%1").arg(pipeline.tangentResidualCostWeight, 0, 'f', 3);
+        registrationLines << QStringLiteral("切向相关权重：%1").arg(pipeline.tangentCorrelationCostWeight, 0, 'f', 3);
+        registrationLines << QStringLiteral("调试可视化：%1")
+                                 .arg(pipeline.generateDebugVisualization ? QStringLiteral("开启") : QStringLiteral("关闭"));
+    }
 
     const QStringList csvLabels = selectedPaperCsvLabels(configPanel_);
     registrationLines << QStringLiteral("导出项目：%1")
@@ -1795,6 +2139,9 @@ void MainWindow::refreshStageSummaries()
         registrationLines << QString();
         registrationLines << QStringLiteral("标定质量：");
         registrationLines << calibrationQualityLine(activeCalibrationCache_);
+    } else if (standardCircleMode) {
+        registrationLines << QString();
+        registrationLines << QStringLiteral("标定状态：标准圆国标检测模式下可直接用标准圆直径做像素当量修正。");
     }
 
     registrationOverviewEdit_->setPlainText(registrationLines.join('\n'));
@@ -1909,12 +2256,14 @@ void MainWindow::updateWorkflowAccessState()
 {
     const bool running = workerThread_ != nullptr;
     const int currentStage = stageStack_ ? stageStack_->currentIndex() : CalibrationStage;
+    const bool standardCircleMode = configPanel_ && configPanel_->standardCircleModeEnabled();
+    const bool canRun = hasActiveCalibration() || standardCircleMode;
 
     if (startButton_) {
-        startButton_->setEnabled(!running && hasActiveCalibration());
+        startButton_->setEnabled(!running && canRun);
     }
     if (moduleRunButton_) {
-        moduleRunButton_->setEnabled(!running && (currentStage == CalibrationStage || hasActiveCalibration()));
+        moduleRunButton_->setEnabled(!running && (currentStage == CalibrationStage || canRun));
     }
     if (stopButton_) {
         stopButton_->setEnabled(running && currentTaskSupportsStop_);
@@ -1934,6 +2283,11 @@ void MainWindow::updateModuleRunButtonText(int stageIndex)
 
     if (stageIndex == CalibrationStage) {
         moduleRunButton_->setText(QStringLiteral("运行标定"));
+        return;
+    }
+
+    if (configPanel_ && configPanel_->standardCircleModeEnabled()) {
+        moduleRunButton_->setText(QStringLiteral("运行标准圆检测"));
         return;
     }
 
@@ -2145,6 +2499,56 @@ void MainWindow::updateReportMetricCards(int loadedImageCount,
 
 void MainWindow::exportSelectedReportCsvs()
 {
+    if (isStandardCircleMode(lastRequest_)) {
+        const bool saveStepSummary = configPanel_ && configPanel_->saveStepSummaryCsv();
+        const bool saveContourPoints = configPanel_ && configPanel_->saveContourPointsCsv();
+        const bool saveCandidateDiagnostics = configPanel_ && configPanel_->saveAlignmentCandidateDiagnosticsCsv();
+
+        QStringList exportedFiles;
+        if (saveStepSummary && !lastRequest_.csvOutputPath.empty()) {
+            exportedFiles << QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.csvOutputPath));
+        }
+        if (saveContourPoints && !lastRequest_.contourPointsCsvOutputPath.empty()) {
+            exportedFiles << QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.contourPointsCsvOutputPath));
+        }
+        const std::string radiiCsvPath = standardCircleRadiiCsvOutputPath(lastRequest_);
+        if (saveContourPoints && !radiiCsvPath.empty() &&
+            std::filesystem::exists(std::filesystem::u8path(radiiCsvPath))) {
+            exportedFiles << QDir::toNativeSeparators(fromUtf8StdString(radiiCsvPath));
+        }
+        if (saveCandidateDiagnostics && !lastRequest_.qualityReviewCsvOutputPath.empty()) {
+            exportedFiles << QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.qualityReviewCsvOutputPath));
+        }
+        if (saveCandidateDiagnostics && !lastRequest_.alignmentCandidateDiagnosticsCsvOutputPath.empty()) {
+            exportedFiles << QDir::toNativeSeparators(
+                fromUtf8StdString(lastRequest_.alignmentCandidateDiagnosticsCsvOutputPath));
+        }
+        if (configPanel_ && configPanel_->saveNormalErrorProfileCsv() &&
+            !lastRequest_.designErrorProfileCsvOutputPath.empty()) {
+            exportedFiles << QDir::toNativeSeparators(
+                fromUtf8StdString(lastRequest_.designErrorProfileCsvOutputPath));
+        }
+        if (configPanel_ && configPanel_->saveTangentProfileCsv() &&
+            !lastRequest_.designErrorSummaryCsvOutputPath.empty()) {
+            exportedFiles << QDir::toNativeSeparators(
+                fromUtf8StdString(lastRequest_.designErrorSummaryCsvOutputPath));
+        }
+
+        exportedFiles.removeDuplicates();
+        if (exportedFiles.isEmpty()) {
+            QMessageBox::information(this,
+                                     QStringLiteral("导出 CSV"),
+                                     QStringLiteral("标准圆模式下请先勾选至少一种可查看的 CSV 类型。"));
+            refreshReportExportState(QStringLiteral("未选择标准圆结果 CSV"));
+            return;
+        }
+
+        appendLog(QStringLiteral("[信息] 标准圆结果文件：\n%1").arg(exportedFiles.join('\n')));
+        refreshReportExportState(QStringLiteral("标准圆结果文件已就绪，共 %1 项").arg(exportedFiles.size()));
+        statusBar()->showMessage(QStringLiteral("标准圆结果文件已就绪，共 %1 项").arg(exportedFiles.size()));
+        return;
+    }
+
     if (!runCache_ || !runCache_->hasStitching() || !runCache_->hasPreprocessedEdges()) {
         QMessageBox::information(this,
                                  QStringLiteral("导出 CSV"),
@@ -2394,11 +2798,19 @@ void MainWindow::refreshPublicationFigurePreview()
 
 void MainWindow::refreshReportExportState(const QString& statusMessage)
 {
+    const bool standardCircleMode = isStandardCircleMode(lastRequest_);
     if (generateFigureButton_) {
-        generateFigureButton_->setEnabled(!workerThread_ && runCache_ && runCache_->hasStitching());
+        generateFigureButton_->setEnabled(!workerThread_ &&
+                                         !standardCircleMode &&
+                                         runCache_ &&
+                                         runCache_->hasStitching());
     }
     if (exportSelectedCsvButton_) {
-        exportSelectedCsvButton_->setEnabled(!workerThread_ && runCache_ && runCache_->hasStitching());
+        const bool canExport =
+            !workerThread_ &&
+            ((standardCircleMode && !lastRequest_.resultOutputDir.empty()) ||
+             (runCache_ && runCache_->hasStitching()));
+        exportSelectedCsvButton_->setEnabled(canExport);
     }
 
     if (!reportExportStatusLabel_) {
@@ -2413,7 +2825,9 @@ void MainWindow::refreshReportExportState(const QString& statusMessage)
     const QStringList labels = selectedPaperCsvLabels(configPanel_);
     if (labels.isEmpty()) {
         reportExportStatusLabel_->setText(
-            QStringLiteral("归档状态：结果已生成，请先勾选需要导出的 CSV 类型 | 自动生成：设计比对、质量审查、候选诊断"));
+            standardCircleMode
+                ? QStringLiteral("归档状态：标准圆结果已生成，请先勾选需要查看的 CSV 类型 | 自动生成：摘要、25点详情、候选覆盖、掩模诊断")
+                : QStringLiteral("归档状态：结果已生成，请先勾选需要导出的 CSV 类型 | 自动生成：设计比对、质量审查、候选诊断"));
         return;
     }
 
@@ -2422,7 +2836,9 @@ void MainWindow::refreshReportExportState(const QString& statusMessage)
             ? QStringLiteral("当前结果目录")
             : QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.resultOutputDir));
     reportExportStatusLabel_->setText(
-        QStringLiteral("归档状态：可导出 CSV：%1 | 输出目录：%2 | 自动生成：设计比对、质量审查、候选诊断")
+        (standardCircleMode
+             ? QStringLiteral("归档状态：可查看 CSV：%1 | 输出目录：%2 | 自动生成：窗口图、边缘叠加、摘要与掩模诊断")
+             : QStringLiteral("归档状态：可导出 CSV：%1 | 输出目录：%2 | 自动生成：设计比对、质量审查、候选诊断"))
             .arg(labels.join(QStringLiteral(", ")), targetDir));
 }
 
@@ -2516,6 +2932,19 @@ QPushButton#secondaryActionButton {
 }
 QPushButton#secondaryActionButton:hover {
     background: #e4f0f8;
+}
+QPushButton#successActionButton {
+    background: #2f7d4a;
+    border-color: #25653b;
+    color: #ffffff;
+}
+QPushButton#successActionButton:hover {
+    background: #25653b;
+}
+QPushButton#successActionButton:checked {
+    background: #1f5b35;
+    border-color: #18472a;
+    color: #ffffff;
 }
 QPushButton#dangerActionButton {
     background: #fff5f5;

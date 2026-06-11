@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace stitch {
 
@@ -71,6 +73,71 @@ bool samePointVector(const std::vector<cv::Point2d>& lhs,
     return true;
 }
 
+double medianOfValues(std::vector<double> values)
+{
+    if (values.empty()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    const std::size_t mid = values.size() / 2;
+    std::nth_element(values.begin(),
+                     values.begin() + static_cast<std::ptrdiff_t>(mid),
+                     values.end());
+    double median = values[mid];
+    if (values.size() % 2 == 0) {
+        const auto lower = std::max_element(values.begin(),
+                                            values.begin() + static_cast<std::ptrdiff_t>(mid));
+        median = 0.5 * (median + *lower);
+    }
+    return median;
+}
+
+double motionPrimaryShift(const StitchStepRecord& step, double dx, double dy)
+{
+    return step.motionAxis == AlignmentAxis::X ? dx : dy;
+}
+
+double motionPerpendicularShift(const StitchStepRecord& step, double dx, double dy)
+{
+    return step.motionAxis == AlignmentAxis::X ? dy : dx;
+}
+
+double stepNormalRmsePx(const StitchStepRecord& step)
+{
+    const ResidualStatistics& stats =
+        step.transform.metrics.normalInlier.valid() ? step.transform.metrics.normalInlier
+                                                    : step.transform.metrics.normalAll;
+    return stats.valid() ? stats.rmse : std::numeric_limits<double>::infinity();
+}
+
+bool isStableReferenceStep(const StitchStepRecord& step)
+{
+    if (step.usedMotionPriorFallback ||
+        step.usedWideSearchRescue ||
+        step.usedUnfilteredEdgeRescue ||
+        step.usedTrajectoryPriorRescue ||
+        step.usedCandidateReselect) {
+        return false;
+    }
+
+    if (step.selectionMode == "image_correlation_rescue" ||
+        step.selectionMode == "wide_search_rescue" ||
+        step.selectionMode == "translation_prior_fallback" ||
+        step.selectionMode == "trajectory_prior_clamp") {
+        return false;
+    }
+
+    return std::isfinite(stepNormalRmsePx(step)) && stepNormalRmsePx(step) <= 0.25;
+}
+
+double stepOverlapRatio(const StitchStepRecord& step, double primaryShiftPx)
+{
+    if (!(step.primaryImageSpanPx > 1e-9)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    return 1.0 - primaryShiftPx / step.primaryImageSpanPx;
+}
+
 bool samePipelineConfig(const StitchPipelineConfig& lhs, const StitchPipelineConfig& rhs)
 {
     return nearlyEqual(lhs.expectedOverlapRatio, rhs.expectedOverlapRatio) &&
@@ -111,7 +178,10 @@ bool samePipelineConfig(const StitchPipelineConfig& lhs, const StitchPipelineCon
            nearlyEqual(lhs.designMaxAbsSlopeForGeneratrix, rhs.designMaxAbsSlopeForGeneratrix) &&
            lhs.designSlopeWindow == rhs.designSlopeWindow &&
            nearlyEqual(lhs.designTrimLeftAfterEndpointMm, rhs.designTrimLeftAfterEndpointMm) &&
-           nearlyEqual(lhs.designTrimRightMm, rhs.designTrimRightMm);
+           nearlyEqual(lhs.designTrimRightMm, rhs.designTrimRightMm) &&
+           lhs.designIgnoreStepTransition == rhs.designIgnoreStepTransition &&
+           nearlyEqual(lhs.designStepTransitionOriginalZMm, rhs.designStepTransitionOriginalZMm) &&
+           nearlyEqual(lhs.designStepTransitionHalfWidthMm, rhs.designStepTransitionHalfWidthMm);
 }
 
 bool isCompleteStitchingCache(const StitchRunCache& cache)
@@ -212,16 +282,67 @@ std::string buildQualityReviewCsv(const pinjie::cad_design::DesignAlignmentResul
                     std::abs(summary.dThetaDeg),
                     0.05,
                     "Best-fit rotation; large values mean angular drift is being absorbed.");
+    appendReviewRow(stream,
+                    "absolute_bias_refine_correction_um",
+                    !summary.appliedAbsoluteBiasRefine || std::abs(summary.absoluteBiasCorrectionUm) <= 180.0,
+                    std::abs(summary.absoluteBiasCorrectionUm),
+                    180.0,
+                    "Final radial bias-refine correction applied after shape best-fit; large values indicate anchor/preset mismatch.");
 
     double worstNormalRmsePx = 0.0;
     std::size_t worstStep = 0;
+    int priorClampedStepCount = 0;
+    std::vector<double> stablePrimaryShiftsPx;
+    std::vector<double> stableOverlapRatios;
+    std::vector<double> nominalPrimaryShiftsPx;
+    std::vector<double> nominalOverlapRatios;
+    double maxPrimaryTrajectoryJumpPx = 0.0;
+    double maxPerpTrajectoryJumpPx = 0.0;
     for (const StitchStepRecord& step : stitching.steps) {
+        if (step.usedMotionPriorFallback || step.transform.direction == "PRIOR") {
+            ++priorClampedStepCount;
+        }
         const ResidualStatistics& normal =
             step.transform.metrics.normalInlier.valid() ? step.transform.metrics.normalInlier
                                                         : step.transform.metrics.normalAll;
         if (normal.valid() && normal.rmse > worstNormalRmsePx) {
             worstNormalRmsePx = normal.rmse;
             worstStep = step.stepIndex;
+        }
+
+        const double actualPrimaryShiftPx =
+            motionPrimaryShift(step, step.transform.dx, step.transform.dy);
+        const double actualPerpShiftPx =
+            motionPerpendicularShift(step, step.transform.dx, step.transform.dy);
+        if (isStableReferenceStep(step)) {
+            stablePrimaryShiftsPx.push_back(actualPrimaryShiftPx);
+            const double overlapRatio = stepOverlapRatio(step, actualPrimaryShiftPx);
+            if (std::isfinite(overlapRatio)) {
+                stableOverlapRatios.push_back(overlapRatio);
+            }
+        }
+
+        if (step.hasNominalPrior) {
+            const double nominalPrimaryShiftPx =
+                motionPrimaryShift(step, step.nominalPriorDx, step.nominalPriorDy);
+            nominalPrimaryShiftsPx.push_back(nominalPrimaryShiftPx);
+            const double overlapRatio = stepOverlapRatio(step, nominalPrimaryShiftPx);
+            if (std::isfinite(overlapRatio)) {
+                nominalOverlapRatios.push_back(overlapRatio);
+            }
+        }
+
+        if (step.hasTrajectoryPrior) {
+            const double trajectoryPrimaryShiftPx =
+                motionPrimaryShift(step, step.trajectoryPriorDx, step.trajectoryPriorDy);
+            const double trajectoryPerpShiftPx =
+                motionPerpendicularShift(step, step.trajectoryPriorDx, step.trajectoryPriorDy);
+            maxPrimaryTrajectoryJumpPx =
+                std::max(maxPrimaryTrajectoryJumpPx,
+                         std::abs(actualPrimaryShiftPx - trajectoryPrimaryShiftPx));
+            maxPerpTrajectoryJumpPx =
+                std::max(maxPerpTrajectoryJumpPx,
+                         std::abs(actualPerpShiftPx - trajectoryPerpShiftPx));
         }
     }
 
@@ -231,6 +352,44 @@ std::string buildQualityReviewCsv(const pinjie::cad_design::DesignAlignmentResul
                     worstNormalRmsePx,
                     0.25,
                     "Worst single-step inlier normal RMSE; worst_step=" + std::to_string(worstStep) + ".");
+    appendReviewRow(stream,
+                    "prior_clamped_step_count",
+                    priorClampedStepCount == 0,
+                    static_cast<double>(priorClampedStepCount),
+                    0.0,
+                    "Steps reported with motion-prior clamp/fallback because local matching was not trustworthy.");
+    const double stablePrimaryMedianPx = medianOfValues(stablePrimaryShiftsPx);
+    const double nominalPrimaryMedianPx = medianOfValues(nominalPrimaryShiftsPx);
+    if (std::isfinite(stablePrimaryMedianPx) && std::isfinite(nominalPrimaryMedianPx)) {
+        appendReviewRow(stream,
+                        "stable_primary_shift_minus_nominal_px",
+                        std::abs(stablePrimaryMedianPx - nominalPrimaryMedianPx) <= 40.0,
+                        std::abs(stablePrimaryMedianPx - nominalPrimaryMedianPx),
+                        40.0,
+                        "Median stable acquisition step differs from the configured overlap prior; large values mean preset overlap is biased.");
+    }
+    const double stableOverlapMedian = medianOfValues(stableOverlapRatios);
+    const double nominalOverlapMedian = medianOfValues(nominalOverlapRatios);
+    if (std::isfinite(stableOverlapMedian) && std::isfinite(nominalOverlapMedian)) {
+        appendReviewRow(stream,
+                        "stable_overlap_minus_nominal_ratio",
+                        std::abs(stableOverlapMedian - nominalOverlapMedian) <= 0.01,
+                        std::abs(stableOverlapMedian - nominalOverlapMedian),
+                        0.01,
+                        "Median effective overlap differs from the configured overlap ratio; values above 0.01 usually indicate preset mismatch.");
+    }
+    appendReviewRow(stream,
+                    "max_primary_jump_from_trajectory_px",
+                    maxPrimaryTrajectoryJumpPx <= 40.0,
+                    maxPrimaryTrajectoryJumpPx,
+                    40.0,
+                    "Largest primary-axis jump relative to the stable trajectory prior; large values indicate a real acquisition-step change.");
+    appendReviewRow(stream,
+                    "max_perp_jump_from_trajectory_px",
+                    maxPerpTrajectoryJumpPx <= 25.0,
+                    maxPerpTrajectoryJumpPx,
+                    25.0,
+                    "Largest cross-axis jump relative to the stable trajectory prior; large values indicate tilt or cross-feed motion during acquisition.");
     return stream.str();
 }
 
@@ -292,8 +451,7 @@ void emitCachedRegistrationArtifacts(const std::vector<cv::Mat>& images,
                                                                images[step.targetImageIndex],
                                                                referenceEdges,
                                                                targetEdges,
-                                                               step.transform,
-                                                               static_cast<int>(step.stepIndex));
+                                                               step);
         callbacks.onImage("debug_step", step.stepIndex, totalSteps, debugImage);
     }
 }
@@ -529,6 +687,13 @@ bool saveVisualArtifactsIfRequested(const StitchRunRequest& request,
                                     StitchRunResult& runResult,
                                     const StitchCallbacks& callbacks)
 {
+    if (request.contourOverlayOutputPath.empty() &&
+        request.stitchedContourProfilePlotOutputPath.empty() &&
+        request.tangentCorrelationAllOutputPath.empty() &&
+        request.tangentCorrelationInlierOutputPath.empty()) {
+        return true;
+    }
+
     const cv::Mat contourOverlay = buildStitchedContourOverlay(runResult.stitching.canvas,
                                                                edges,
                                                                runResult.stitching.imageTransforms);

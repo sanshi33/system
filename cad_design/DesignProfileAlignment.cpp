@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -26,6 +27,11 @@ constexpr double kMaxContinuationWindowRmseUm = 120.0;
 constexpr double kMaxContinuationWindowAbsMeanUm = 120.0;
 constexpr double kPrimaryStartWindowRmseUm = 35.0;
 constexpr double kPrimaryStartWindowAbsMeanUm = 35.0;
+constexpr double kLeftTransitionSearchMaxMm = 3.0;
+constexpr double kLeftTransitionWindowMm = 0.40;
+constexpr std::size_t kLeftTransitionMinPointCount = 30;
+constexpr double kLeftTransitionMedianCenteredErrorUm = 8.0;
+constexpr double kLeftTransitionP90CenteredErrorUm = 20.0;
 
 struct StitchedContourSample {
     double xPx{0.0};
@@ -70,6 +76,8 @@ struct EvaluationResult {
     double objective{std::numeric_limits<double>::infinity()};
     double dzMm{0.0};
     double drMm{0.0};
+    double axialScaleFactor{1.0};
+    double axialQuadraticTermMm{0.0};
     std::vector<DesignErrorProfilePoint> profilePoints;
     DesignErrorSummary summary;
 };
@@ -357,6 +365,27 @@ double radiusFromYPx(const double yPx, const stitch::StitchPipelineConfig& confi
     return sign * yPx * config.designPixelSizeMm;
 }
 
+double stepTransitionCenterSMm(const stitch::StitchPipelineConfig& config)
+{
+    return config.designReverseZ
+               ? (kDesignProfileMaxZMm - config.designStepTransitionOriginalZMm)
+               : config.designStepTransitionOriginalZMm;
+}
+
+bool isInsideStepTransitionRegion(const double sMm,
+                                  const stitch::StitchPipelineConfig& config)
+{
+    if (!config.designIgnoreStepTransition ||
+        !std::isfinite(sMm) ||
+        !std::isfinite(config.designStepTransitionOriginalZMm) ||
+        !(config.designStepTransitionHalfWidthMm > 1e-9)) {
+        return false;
+    }
+
+    const double centerSMm = stepTransitionCenterSMm(config);
+    return std::abs(sMm - centerSMm) <= config.designStepTransitionHalfWidthMm + 1e-9;
+}
+
 std::vector<PointRun> buildAcceptedRuns(const std::vector<GeneratrixCandidatePoint>& points,
                                         const stitch::StitchPipelineConfig& config)
 {
@@ -445,6 +474,9 @@ EvaluationResult evaluateAnchorCandidate(const std::vector<GeneratrixCandidatePo
 
         const double sAlignedMm = (inputPoint.xPx - anchorXPx) * config.designPixelSizeMm;
         if (sAlignedMm < config.designTrimLeftAfterEndpointMm - 1e-9) {
+            continue;
+        }
+        if (isInsideStepTransitionRegion(sAlignedMm, config)) {
             continue;
         }
 
@@ -558,6 +590,10 @@ bool evalPointAgainstDesign(const GeneratrixCandidatePoint& point,
                             const double drMm,
                             double& normalErrorUm)
 {
+    if (isInsideStepTransitionRegion(point.sBaseMm, config)) {
+        return false;
+    }
+
     const DesignEval design = evalDesignRadiusCompare(point.sBaseMm, config.designReverseZ);
     if (!design.valid) {
         return false;
@@ -744,8 +780,116 @@ MeasuredGeneratrixData applyAcceptedRuns(MeasuredGeneratrixData data,
             GeneratrixCandidatePoint& point = data.points[index];
             const bool leftTrimOk = point.sBaseMm >= config.designTrimLeftAfterEndpointMm - 1e-9;
             const bool rightTrimOk = point.sBaseMm <= maxAcceptedBaseMm - config.designTrimRightMm + 1e-9;
-            point.trimAccepted = point.slopeAccepted && leftTrimOk && rightTrimOk;
+            const bool transitionOk = !isInsideStepTransitionRegion(point.sBaseMm, config);
+            point.trimAccepted = point.slopeAccepted && leftTrimOk && rightTrimOk && transitionOk;
         }
+    }
+
+    return data;
+}
+
+MeasuredGeneratrixData rebaseAcceptedGeneratrixToIndex(MeasuredGeneratrixData data,
+                                                       const std::size_t rebaseIndex,
+                                                       const stitch::StitchPipelineConfig& config)
+{
+    if (rebaseIndex >= data.points.size()) {
+        return data;
+    }
+
+    const GeneratrixCandidatePoint& rebasePoint = data.points[rebaseIndex];
+    const double rebaseBaseMm = rebasePoint.sBaseMm;
+    if (!std::isfinite(rebaseBaseMm)) {
+        return data;
+    }
+
+    for (GeneratrixCandidatePoint& point : data.points) {
+        point.sBaseMm -= rebaseBaseMm;
+    }
+
+    data.maxBaseMm = std::max(0.0, data.maxBaseMm - rebaseBaseMm);
+    data.anchorPointIndex = rebaseIndex;
+    data.anchorXPx = rebasePoint.xPx;
+    data.anchorYPx = rebasePoint.yPx;
+    data.anchorMeasuredRadiusMm = radiusFromYPx(rebasePoint.yPx, config);
+    data.anchorBaseMm += rebaseBaseMm;
+
+    if (data.primaryRunBeginIndex < data.points.size() && data.primaryRunBeginIndex < rebaseIndex) {
+        data.primaryRunBeginIndex = rebaseIndex;
+    }
+    if (data.primaryRunEndIndex < data.primaryRunBeginIndex) {
+        data.primaryRunEndIndex = data.primaryRunBeginIndex;
+    }
+    return data;
+}
+
+MeasuredGeneratrixData trimResidualLeftEndpointTransition(MeasuredGeneratrixData data,
+                                                          const stitch::StitchPipelineConfig& config,
+                                                          const double drMm)
+{
+    auto firstAcceptedIt = std::find_if(data.points.begin(), data.points.end(), [](const auto& point) {
+        return point.trimAccepted;
+    });
+    if (firstAcceptedIt == data.points.end()) {
+        return data;
+    }
+
+    const std::size_t firstAcceptedIndex = static_cast<std::size_t>(std::distance(data.points.begin(), firstAcceptedIt));
+    const double searchEndMm =
+        firstAcceptedIt->sBaseMm + std::min(kLeftTransitionSearchMaxMm, std::max(0.0, data.maxBaseMm * 0.2));
+
+    for (std::size_t startIndex = firstAcceptedIndex; startIndex < data.points.size(); ++startIndex) {
+        const GeneratrixCandidatePoint& startPoint = data.points[startIndex];
+        if (!startPoint.trimAccepted) {
+            continue;
+        }
+        if (startPoint.sBaseMm > searchEndMm + 1e-9) {
+            break;
+        }
+
+        const double windowEndMm = startPoint.sBaseMm + kLeftTransitionWindowMm;
+        std::vector<double> errorsUm;
+        errorsUm.reserve(kLeftTransitionMinPointCount * 2);
+        for (std::size_t index = startIndex; index < data.points.size(); ++index) {
+            const GeneratrixCandidatePoint& point = data.points[index];
+            if (!point.trimAccepted) {
+                continue;
+            }
+            if (point.sBaseMm > windowEndMm + 1e-9) {
+                break;
+            }
+
+            double normalErrorUm = 0.0;
+            if (!evalPointAgainstDesign(point, config, drMm, normalErrorUm)) {
+                continue;
+            }
+            errorsUm.push_back(normalErrorUm);
+        }
+
+        if (errorsUm.size() < kLeftTransitionMinPointCount) {
+            continue;
+        }
+
+        const double medianErrorUm = medianOfValues(errorsUm);
+        std::vector<double> centeredAbsErrorsUm;
+        centeredAbsErrorsUm.reserve(errorsUm.size());
+        for (const double errorUm : errorsUm) {
+            centeredAbsErrorsUm.push_back(std::abs(errorUm - medianErrorUm));
+        }
+
+        const double medianCenteredUm = medianOfValues(centeredAbsErrorsUm);
+        const double p90CenteredUm = percentileAbs(centeredAbsErrorsUm, 0.90);
+        if (medianCenteredUm > kLeftTransitionMedianCenteredErrorUm ||
+            p90CenteredUm > kLeftTransitionP90CenteredErrorUm) {
+            continue;
+        }
+
+        for (std::size_t index = firstAcceptedIndex; index < startIndex; ++index) {
+            data.points[index].trimAccepted = false;
+        }
+        if (data.primaryRunBeginIndex < data.points.size() && data.primaryRunBeginIndex < startIndex) {
+            data.primaryRunBeginIndex = startIndex;
+        }
+        return data;
     }
 
     return data;
@@ -950,7 +1094,9 @@ MeasuredGeneratrixData extractMeasuredGeneratrixForDesignComparison(
         const bool rightTrimOk = point.sBaseMm <= maxAcceptedBaseMm - config.designTrimRightMm + 1e-9;
         const bool afterAnchor = index >= data.anchorPointIndex;
         const bool inPrimaryRun = index >= data.primaryRunBeginIndex && index <= data.primaryRunEndIndex;
-        point.trimAccepted = point.slopeAccepted && inPrimaryRun && afterAnchor && leftTrimOk && rightTrimOk;
+        const bool transitionOk = !isInsideStepTransitionRegion(point.sBaseMm, config);
+        point.trimAccepted =
+            point.slopeAccepted && inPrimaryRun && afterAnchor && leftTrimOk && rightTrimOk && transitionOk;
     }
 
     return data;
@@ -1040,11 +1186,15 @@ EvaluationResult evaluateAlignedProfile(const MeasuredGeneratrixData& data,
                                         const stitch::StitchPipelineConfig& config,
                                         const double dzMm,
                                         const double drMm,
-                                        const bool usePolylineDistance = true)
+                                        const bool usePolylineDistance = true,
+                                        const double axialScaleFactor = 1.0,
+                                        const double axialQuadraticTermMm = 0.0)
 {
     EvaluationResult evaluation;
     evaluation.dzMm = dzMm;
     evaluation.drMm = drMm;
+    evaluation.axialScaleFactor = axialScaleFactor;
+    evaluation.axialQuadraticTermMm = axialQuadraticTermMm;
     evaluation.profilePoints.reserve(data.points.size());
     const std::vector<DesignPolylinePoint> designPolyline =
         usePolylineDistance ? buildDesignPolyline(config.designReverseZ) : std::vector<DesignPolylinePoint>{};
@@ -1060,7 +1210,12 @@ EvaluationResult evaluateAlignedProfile(const MeasuredGeneratrixData& data,
         point.supportCount = inputPoint.supportCount;
         point.xPx = inputPoint.xPx;
         point.yPx = inputPoint.yPx;
-        point.sAlignedMm = inputPoint.sBaseMm + dzMm;
+        const double normalizedBase =
+            data.maxBaseMm > 1e-9 ? std::clamp(inputPoint.sBaseMm / data.maxBaseMm, 0.0, 1.0) : 0.0;
+        point.sAlignedMm =
+            inputPoint.sBaseMm * axialScaleFactor +
+            dzMm +
+            axialQuadraticTermMm * normalizedBase * normalizedBase;
         point.rAlignedMm = inputPoint.rRawMm + drMm;
         point.designRadiusMm = std::numeric_limits<double>::quiet_NaN();
         point.nearestDesignSMm = std::numeric_limits<double>::quiet_NaN();
@@ -1076,7 +1231,8 @@ EvaluationResult evaluateAlignedProfile(const MeasuredGeneratrixData& data,
         point.normalErrorUm = std::numeric_limits<double>::quiet_NaN();
         point.profileErrorUm = std::numeric_limits<double>::quiet_NaN();
 
-        if (inputPoint.trimAccepted) {
+        if (inputPoint.trimAccepted &&
+            !isInsideStepTransitionRegion(point.sAlignedMm, config)) {
             const DesignEval design = evalDesignRadiusCompare(point.sAlignedMm, config.designReverseZ);
             const NearestDesignPoint nearest =
                 usePolylineDistance ? findNearestDesignPoint(designPolyline, point.sAlignedMm, point.rAlignedMm)
@@ -1200,6 +1356,8 @@ EvaluationResult evaluateAlignedProfile(const MeasuredGeneratrixData& data,
     evaluation.summary.designReverseZ = config.designReverseZ;
     evaluation.summary.useLeftEndpointAnchor = config.designUseLeftEndpointAnchor;
     evaluation.summary.evaluateProfileForm = config.designEvaluateProfileForm;
+    evaluation.summary.axialScaleFactor = axialScaleFactor;
+    evaluation.summary.axialQuadraticTermMm = axialQuadraticTermMm;
     evaluation.summary.anchorXPx = data.anchorXPx;
     evaluation.summary.anchorYPx = data.anchorYPx;
     evaluation.summary.pixelSizeMm = config.designPixelSizeMm;
@@ -1214,6 +1372,377 @@ EvaluationResult evaluateAlignedProfile(const MeasuredGeneratrixData& data,
     evaluation.summary.profileStats = profileStats;
     evaluation.objective = config.designEvaluateProfileForm ? profileStats.rmseUm : normalStatsFiltered.rmseUm;
     return evaluation;
+}
+
+double absoluteFilteredRmseObjective(const EvaluationResult& evaluation)
+{
+    if (!evaluation.ok) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return evaluation.summary.absoluteFilteredStats.rmseUm;
+}
+
+bool isBetterAbsoluteRefineResult(const EvaluationResult& candidate, const EvaluationResult& currentBest)
+{
+    if (!candidate.ok) {
+        return false;
+    }
+    if (!currentBest.ok) {
+        return true;
+    }
+
+    const double candidateAbs = absoluteFilteredRmseObjective(candidate);
+    const double currentAbs = absoluteFilteredRmseObjective(currentBest);
+    if (candidateAbs + 1e-9 < currentAbs) {
+        return true;
+    }
+    if (std::abs(candidateAbs - currentAbs) > 1e-9) {
+        return false;
+    }
+
+    if (candidate.summary.profileStats.rmseUm + 1e-9 < currentBest.summary.profileStats.rmseUm) {
+        return true;
+    }
+    if (std::abs(candidate.summary.profileStats.rmseUm - currentBest.summary.profileStats.rmseUm) > 1e-9) {
+        return false;
+    }
+
+    return std::abs(candidate.summary.meanNormalErrorUm) + 1e-9 <
+           std::abs(currentBest.summary.meanNormalErrorUm);
+}
+
+EvaluationResult refineAbsoluteBiasAlignment(const MeasuredGeneratrixData& data,
+                                            const stitch::StitchPipelineConfig& config,
+                                            const double anchorDrMm,
+                                            const EvaluationResult& seed)
+{
+    EvaluationResult best = seed;
+    if (!seed.ok || !config.designEnableBestFitTranslation) {
+        return best;
+    }
+
+    const double seedBiasUm = seed.summary.meanNormalErrorUm;
+    if (!std::isfinite(seedBiasUm) || std::abs(seedBiasUm) < 15.0) {
+        return best;
+    }
+
+    const double allowedDrMin = anchorDrMm + config.designBestFitDrMinMm;
+    const double allowedDrMax = anchorDrMm + config.designBestFitDrMaxMm;
+    if (!std::isfinite(allowedDrMin) || !std::isfinite(allowedDrMax) || allowedDrMin > allowedDrMax) {
+        return best;
+    }
+
+    const double predictedDrMm =
+        std::clamp(seed.summary.drMm - seedBiasUm / 1000.0, allowedDrMin, allowedDrMax);
+    const double refineHalfWindowMm =
+        std::clamp(std::max(0.05, std::abs(seedBiasUm) * 0.0013), 0.05, 0.25);
+    const double refineStepMm = std::max(0.001, std::min(config.designBestFitStepMm, 0.0025));
+    const double refineMinDr = std::max(allowedDrMin, predictedDrMm - refineHalfWindowMm);
+    const double refineMaxDr = std::min(allowedDrMax, predictedDrMm + refineHalfWindowMm);
+
+    const auto considerCandidate = [&](const double drMm) {
+        const EvaluationResult candidate = evaluateAlignedProfile(
+            data,
+            config,
+            seed.summary.dzMm,
+            drMm,
+            true,
+            seed.summary.axialScaleFactor,
+            seed.summary.axialQuadraticTermMm
+        );
+        if (isBetterAbsoluteRefineResult(candidate, best)) {
+            best = candidate;
+        }
+    };
+
+    considerCandidate(seed.summary.drMm);
+    considerCandidate(predictedDrMm);
+    for (double drMm = refineMinDr; drMm <= refineMaxDr + 1e-12; drMm += refineStepMm) {
+        considerCandidate(drMm);
+    }
+
+    return best;
+}
+
+bool isBetterAxialScaleRefineResult(const EvaluationResult& candidate,
+                                    const EvaluationResult& currentBest)
+{
+    if (!candidate.ok) {
+        return false;
+    }
+    if (!currentBest.ok) {
+        return true;
+    }
+    if (candidate.objective + 1e-9 < currentBest.objective) {
+        return true;
+    }
+    if (std::abs(candidate.objective - currentBest.objective) > 1e-9) {
+        return false;
+    }
+    return std::abs(candidate.summary.axialScaleFactor - 1.0) + 1e-12 <
+           std::abs(currentBest.summary.axialScaleFactor - 1.0);
+}
+
+EvaluationResult refineAxialScaleAlignment(const MeasuredGeneratrixData& data,
+                                           const stitch::StitchPipelineConfig& config,
+                                           const EvaluationResult& seed)
+{
+    EvaluationResult best = seed;
+    if (!seed.ok) {
+        return best;
+    }
+
+    constexpr double kScaleMin = 0.9975;
+    constexpr double kScaleMax = 1.0025;
+    constexpr double kScaleStep = 0.00025;
+    constexpr double kDzHalfWindowMm = 0.20;
+    constexpr double kMinMeaningfulImprovementUm = 0.05;
+    const double dzStepMm = std::max(0.01, std::min(config.designBestFitStepMm * 2.0, 0.02));
+    const double dzMin = std::max(config.designBestFitDzMinMm, seed.summary.dzMm - kDzHalfWindowMm);
+    const double dzMax = std::min(config.designBestFitDzMaxMm, seed.summary.dzMm + kDzHalfWindowMm);
+
+    const auto considerCandidate = [&](const double scaleFactor, const double dzMm) {
+        const EvaluationResult candidate =
+            evaluateAlignedProfile(
+                data,
+                config,
+                dzMm,
+                seed.summary.drMm,
+                true,
+                scaleFactor,
+                seed.summary.axialQuadraticTermMm
+            );
+        if (isBetterAxialScaleRefineResult(candidate, best)) {
+            best = candidate;
+        }
+    };
+
+    considerCandidate(seed.summary.axialScaleFactor, seed.summary.dzMm);
+    considerCandidate(1.0, seed.summary.dzMm);
+    for (double scaleFactor = kScaleMin; scaleFactor <= kScaleMax + 1e-12; scaleFactor += kScaleStep) {
+        for (double dzMm = dzMin; dzMm <= dzMax + 1e-12; dzMm += dzStepMm) {
+            considerCandidate(scaleFactor, dzMm);
+        }
+    }
+
+    if (!best.ok || best.objective + kMinMeaningfulImprovementUm >= seed.objective) {
+        return seed;
+    }
+    return best;
+}
+
+bool isBetterAxialQuadraticRefineResult(const EvaluationResult& candidate,
+                                        const EvaluationResult& currentBest)
+{
+    if (!candidate.ok) {
+        return false;
+    }
+    if (!currentBest.ok) {
+        return true;
+    }
+    if (candidate.objective + 1e-9 < currentBest.objective) {
+        return true;
+    }
+    if (std::abs(candidate.objective - currentBest.objective) > 1e-9) {
+        return false;
+    }
+    return std::abs(candidate.summary.axialQuadraticTermMm) + 1e-12 <
+           std::abs(currentBest.summary.axialQuadraticTermMm);
+}
+
+EvaluationResult refineAxialQuadraticAlignment(const MeasuredGeneratrixData& data,
+                                               const stitch::StitchPipelineConfig& config,
+                                               const EvaluationResult& seed)
+{
+    EvaluationResult best = seed;
+    if (!seed.ok || data.maxBaseMm <= 1e-9) {
+        return best;
+    }
+
+    constexpr double kQuadraticMinMm = -0.40;
+    constexpr double kQuadraticMaxMm = 0.40;
+    constexpr double kQuadraticStepMm = 0.01;
+    constexpr double kDzHalfWindowMm = 0.20;
+    constexpr double kMinMeaningfulImprovementUm = 0.05;
+    const double dzStepMm = std::max(0.01, std::min(config.designBestFitStepMm * 2.0, 0.02));
+    const double dzMin = std::max(config.designBestFitDzMinMm, seed.summary.dzMm - kDzHalfWindowMm);
+    const double dzMax = std::min(config.designBestFitDzMaxMm, seed.summary.dzMm + kDzHalfWindowMm);
+
+    const auto considerCandidate = [&](const double quadraticTermMm, const double dzMm) {
+        const EvaluationResult candidate =
+            evaluateAlignedProfile(data,
+                                   config,
+                                   dzMm,
+                                   seed.summary.drMm,
+                                   true,
+                                   seed.summary.axialScaleFactor,
+                                   quadraticTermMm);
+        if (isBetterAxialQuadraticRefineResult(candidate, best)) {
+            best = candidate;
+        }
+    };
+
+    considerCandidate(seed.summary.axialQuadraticTermMm, seed.summary.dzMm);
+    considerCandidate(0.0, seed.summary.dzMm);
+    for (double quadraticTermMm = kQuadraticMinMm;
+         quadraticTermMm <= kQuadraticMaxMm + 1e-12;
+         quadraticTermMm += kQuadraticStepMm) {
+        for (double dzMm = dzMin; dzMm <= dzMax + 1e-12; dzMm += dzStepMm) {
+            considerCandidate(quadraticTermMm, dzMm);
+        }
+    }
+
+    if (!best.ok || best.objective + kMinMeaningfulImprovementUm >= seed.objective) {
+        return seed;
+    }
+    return best;
+}
+
+struct AnchoredQuadraticCorrectionFit {
+    bool ok{false};
+    double linearCoeffUm{0.0};
+    double quadraticCoeffUm{0.0};
+    double candidateRmseUm{std::numeric_limits<double>::infinity()};
+};
+
+AnchoredQuadraticCorrectionFit fitAnchoredQuadraticNormalDriftCorrection(
+    const std::vector<DesignErrorProfilePoint>& points)
+{
+    AnchoredQuadraticCorrectionFit fit;
+    std::vector<const DesignErrorProfilePoint*> usedPoints;
+    usedPoints.reserve(points.size());
+    double sMin = std::numeric_limits<double>::infinity();
+    double sMax = -std::numeric_limits<double>::infinity();
+    for (const DesignErrorProfilePoint& point : points) {
+        if (!point.isUsed ||
+            !std::isfinite(point.sAlignedMm) ||
+            !std::isfinite(point.normalErrorUm)) {
+            continue;
+        }
+        usedPoints.push_back(&point);
+        sMin = std::min(sMin, point.sAlignedMm);
+        sMax = std::max(sMax, point.sAlignedMm);
+    }
+    if (usedPoints.size() < 200 || !std::isfinite(sMin) || !std::isfinite(sMax) || sMax <= sMin + 1e-9) {
+        return fit;
+    }
+
+    double sumX2 = 0.0;
+    double sumX3 = 0.0;
+    double sumX4 = 0.0;
+    double sumXY = 0.0;
+    double sumX2Y = 0.0;
+    for (const DesignErrorProfilePoint* point : usedPoints) {
+        const double x = std::clamp((point->sAlignedMm - sMin) / (sMax - sMin), 0.0, 1.0);
+        const double x2 = x * x;
+        sumX2 += x2;
+        sumX3 += x2 * x;
+        sumX4 += x2 * x2;
+        sumXY += x * point->normalErrorUm;
+        sumX2Y += x2 * point->normalErrorUm;
+    }
+
+    const double det = sumX2 * sumX4 - sumX3 * sumX3;
+    if (std::abs(det) < 1e-9) {
+        return fit;
+    }
+
+    fit.linearCoeffUm = (sumXY * sumX4 - sumX2Y * sumX3) / det;
+    fit.quadraticCoeffUm = (sumX2 * sumX2Y - sumX3 * sumXY) / det;
+
+    double sse = 0.0;
+    for (const DesignErrorProfilePoint* point : usedPoints) {
+        const double x = std::clamp((point->sAlignedMm - sMin) / (sMax - sMin), 0.0, 1.0);
+        const double correctionUm = fit.linearCoeffUm * x + fit.quadraticCoeffUm * x * x;
+        const double correctedUm = point->normalErrorUm - correctionUm;
+        sse += correctedUm * correctedUm;
+    }
+    fit.candidateRmseUm = std::sqrt(sse / static_cast<double>(usedPoints.size()));
+    fit.ok = true;
+    return fit;
+}
+
+void applyLowFrequencyNormalDriftCorrection(EvaluationResult& evaluation)
+{
+    if (!evaluation.ok) {
+        return;
+    }
+
+    const AnchoredQuadraticCorrectionFit fit =
+        fitAnchoredQuadraticNormalDriftCorrection(evaluation.profilePoints);
+    if (!fit.ok) {
+        return;
+    }
+
+    constexpr double kMinMeaningfulImprovementUm = 0.10;
+    constexpr double kMaxTailCorrectionUm = 120.0;
+    const double baselineRmseUm = evaluation.summary.normalStats.rmseUm;
+    const double tailCorrectionUm = fit.linearCoeffUm + fit.quadraticCoeffUm;
+    if (!std::isfinite(baselineRmseUm) ||
+        !std::isfinite(fit.candidateRmseUm) ||
+        fit.candidateRmseUm + kMinMeaningfulImprovementUm >= baselineRmseUm ||
+        std::abs(tailCorrectionUm) > kMaxTailCorrectionUm) {
+        return;
+    }
+
+    double sMin = std::numeric_limits<double>::infinity();
+    double sMax = -std::numeric_limits<double>::infinity();
+    for (const DesignErrorProfilePoint& point : evaluation.profilePoints) {
+        if (!point.isUsed ||
+            !std::isfinite(point.sAlignedMm) ||
+            !std::isfinite(point.normalErrorUm)) {
+            continue;
+        }
+        sMin = std::min(sMin, point.sAlignedMm);
+        sMax = std::max(sMax, point.sAlignedMm);
+    }
+    if (!std::isfinite(sMin) || !std::isfinite(sMax) || sMax <= sMin + 1e-9) {
+        return;
+    }
+
+    std::vector<double> correctedAll;
+    std::vector<double> correctedUsed;
+    correctedAll.reserve(evaluation.profilePoints.size());
+    correctedUsed.reserve(evaluation.summary.usedCount);
+
+    for (DesignErrorProfilePoint& point : evaluation.profilePoints) {
+        if (!std::isfinite(point.normalErrorUm) || !std::isfinite(point.sAlignedMm)) {
+            continue;
+        }
+        const double x = std::clamp((point.sAlignedMm - sMin) / (sMax - sMin), 0.0, 1.0);
+        const double correctionUm = fit.linearCoeffUm * x + fit.quadraticCoeffUm * x * x;
+        point.normalErrorUm -= correctionUm;
+        point.normalErrorMm = point.normalErrorUm / 1000.0;
+        correctedAll.push_back(point.normalErrorUm);
+        if (point.isUsed) {
+            correctedUsed.push_back(point.normalErrorUm);
+        }
+    }
+
+    if (correctedUsed.size() < kMinUsedPointCount) {
+        return;
+    }
+
+    const ErrorStats correctedAllStats = buildErrorStats(correctedAll);
+    const ErrorStats correctedUsedStats = buildErrorStats(correctedUsed);
+    std::vector<double> correctedProfileErrors;
+    correctedProfileErrors.reserve(correctedUsed.size());
+    for (DesignErrorProfilePoint& point : evaluation.profilePoints) {
+        if (!point.isUsed || !std::isfinite(point.normalErrorUm)) {
+            continue;
+        }
+        point.profileErrorUm = point.normalErrorUm - correctedUsedStats.meanUm;
+        correctedProfileErrors.push_back(point.profileErrorUm);
+    }
+    const ErrorStats correctedProfileStats = buildErrorStats(correctedProfileErrors);
+
+    evaluation.summary.meanNormalErrorUm = correctedUsedStats.meanUm;
+    evaluation.summary.absoluteAllStats = correctedAllStats;
+    evaluation.summary.absoluteFilteredStats = correctedUsedStats;
+    evaluation.summary.normalStats = correctedUsedStats;
+    evaluation.summary.profileStats = correctedProfileStats;
+    evaluation.objective =
+        evaluation.summary.evaluateProfileForm ? correctedProfileStats.rmseUm : correctedUsedStats.rmseUm;
 }
 
 EvaluationResult runBestFitIfEnabled(const MeasuredGeneratrixData& data,
@@ -1417,8 +1946,23 @@ EvaluationResult runBestFitIfEnabled(const MeasuredGeneratrixData& data,
         best.summary.dThetaDeg = bestThetaForSummary;
         return best;
     }
+
+    finalEvaluation = refineAxialScaleAlignment(finalData, config, finalEvaluation);
     finalEvaluation.summary.dThetaDeg = bestThetaForSummary;
-    return finalEvaluation;
+    finalEvaluation = refineAxialQuadraticAlignment(finalData, config, finalEvaluation);
+    finalEvaluation.summary.dThetaDeg = bestThetaForSummary;
+    EvaluationResult refinedEvaluation =
+        refineAbsoluteBiasAlignment(finalData, config, anchorDrMm, finalEvaluation);
+    refinedEvaluation.summary.dThetaDeg = bestThetaForSummary;
+    refinedEvaluation.summary.preRefineMeanNormalErrorUm = finalEvaluation.summary.meanNormalErrorUm;
+    refinedEvaluation.summary.preRefineAbsoluteFilteredRmseUm =
+        finalEvaluation.summary.absoluteFilteredStats.rmseUm;
+    refinedEvaluation.summary.absoluteBiasCorrectionUm =
+        (refinedEvaluation.summary.drMm - finalEvaluation.summary.drMm) * 1000.0;
+    refinedEvaluation.summary.appliedAbsoluteBiasRefine =
+        std::abs(refinedEvaluation.summary.absoluteBiasCorrectionUm) > 1e-6;
+    applyLowFrequencyNormalDriftCorrection(refinedEvaluation);
+    return refinedEvaluation;
 }
 
 std::string buildProfileCsv(const std::vector<DesignErrorProfilePoint>& points)
@@ -1458,7 +2002,9 @@ std::string buildProfileCsv(const std::vector<DesignErrorProfilePoint>& points)
 std::string buildSummaryCsv(const DesignErrorSummary& summary)
 {
     std::ostringstream stream;
-    stream << "dz_mm,dr_mm,dtheta_deg,design_reverse_z,use_left_endpoint_anchor,design_evaluate_profile_form,anchor_x_px,anchor_y_px,"
+    stream << "dz_mm,dr_mm,dtheta_deg,axial_scale_factor,axial_quadratic_term_mm,applied_absolute_bias_refine,absolute_bias_correction_um,"
+              "pre_refine_mean_normal_error_um,pre_refine_absolute_filtered_rmse_um,"
+              "design_reverse_z,use_left_endpoint_anchor,design_evaluate_profile_form,anchor_x_px,anchor_y_px,"
               "pixel_size_mm,candidate_count,used_count,outlier_count,outlier_ratio,mean_normal_error_um,normal_rmse_um,normal_mae_um,normal_p95_abs_um,"
               "normal_max_pos_um,normal_max_neg_um,normal_pv_um,profile_rms_um,profile_mae_um,profile_p95_abs_um,"
               "profile_max_pos_um,profile_max_neg_um,profile_pv_um,absolute_all_mean_um,absolute_all_rmse_um,"
@@ -1469,6 +2015,12 @@ std::string buildSummaryCsv(const DesignErrorSummary& summary)
     stream << csvCell(summary.dzMm, 6) << ","
            << csvCell(summary.drMm, 6) << ","
            << csvCell(summary.dThetaDeg, 6) << ","
+           << csvCell(summary.axialScaleFactor, 6) << ","
+           << csvCell(summary.axialQuadraticTermMm, 6) << ","
+           << (summary.appliedAbsoluteBiasRefine ? 1 : 0) << ","
+           << csvCell(summary.absoluteBiasCorrectionUm, 6) << ","
+           << csvCell(summary.preRefineMeanNormalErrorUm, 6) << ","
+           << csvCell(summary.preRefineAbsoluteFilteredRmseUm, 6) << ","
            << (summary.designReverseZ ? 1 : 0) << ","
            << (summary.useLeftEndpointAnchor ? 1 : 0) << ","
            << (summary.evaluateProfileForm ? 1 : 0) << ","
@@ -1567,6 +2119,76 @@ void drawScatter(cv::Mat& canvas,
     }
 }
 
+void drawInfoBox(cv::Mat& canvas,
+                 const std::string& text,
+                 const cv::Point& anchor,
+                 const double fontScale,
+                 const cv::Scalar& textColor,
+                 const cv::Scalar& fillColor = cv::Scalar(252, 252, 252),
+                 const cv::Scalar& borderColor = cv::Scalar(220, 220, 220),
+                 const int thickness = 1)
+{
+    int baseline = 0;
+    const cv::Size textSize = cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale, thickness, &baseline);
+    const int padX = 10;
+    const int padY = 8;
+    cv::Rect box(anchor.x,
+                 anchor.y - textSize.height - padY,
+                 textSize.width + padX * 2,
+                 textSize.height + padY * 2 + baseline);
+    box &= cv::Rect(0, 0, canvas.cols, canvas.rows);
+    if (box.width <= 0 || box.height <= 0) {
+        return;
+    }
+
+    cv::rectangle(canvas, box, fillColor, cv::FILLED, cv::LINE_AA);
+    cv::rectangle(canvas, box, borderColor, 1, cv::LINE_AA);
+    cv::putText(canvas,
+                text,
+                cv::Point(box.x + padX, box.y + padY + textSize.height),
+                cv::FONT_HERSHEY_SIMPLEX,
+                fontScale,
+                textColor,
+                thickness,
+                cv::LINE_AA);
+}
+
+void drawPlotGrid(cv::Mat& canvas,
+                  const cv::Rect& rect,
+                  const double xMin,
+                  const double xMax,
+                  const double yMin,
+                  const double yMax,
+                  const int xTicks,
+                  const int yTicks)
+{
+    cv::rectangle(canvas, rect, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+
+    for (int tick = 0; tick <= yTicks; ++tick) {
+        const double ratio = static_cast<double>(tick) / static_cast<double>(yTicks);
+        const int y = rect.y + rect.height - static_cast<int>(std::lround(ratio * rect.height));
+        cv::line(canvas, cv::Point(rect.x, y), cv::Point(rect.x + rect.width, y),
+                 cv::Scalar(238, 238, 238), 1, cv::LINE_AA);
+
+        std::ostringstream label;
+        label << std::fixed << std::setprecision(2) << (yMin + ratio * (yMax - yMin));
+        cv::putText(canvas, label.str(), cv::Point(rect.x - 68, y + 5), cv::FONT_HERSHEY_SIMPLEX, 0.46,
+                    cv::Scalar(92, 92, 92), 1, cv::LINE_AA);
+    }
+
+    for (int tick = 0; tick <= xTicks; ++tick) {
+        const double ratio = static_cast<double>(tick) / static_cast<double>(xTicks);
+        const int x = rect.x + static_cast<int>(std::lround(ratio * rect.width));
+        cv::line(canvas, cv::Point(x, rect.y), cv::Point(x, rect.y + rect.height),
+                 cv::Scalar(244, 244, 244), 1, cv::LINE_AA);
+
+        std::ostringstream label;
+        label << std::fixed << std::setprecision(1) << (xMin + ratio * (xMax - xMin));
+        cv::putText(canvas, label.str(), cv::Point(x - 18, rect.y + rect.height + 24), cv::FONT_HERSHEY_SIMPLEX,
+                    0.44, cv::Scalar(92, 92, 92), 1, cv::LINE_AA);
+    }
+}
+
 } // namespace
 
 DesignAlignmentResult compareMeasuredProfileToDesign(const std::vector<stitch::EdgeVariants>& edges,
@@ -1610,6 +2232,7 @@ DesignAlignmentResult compareMeasuredProfileToDesign(const std::vector<stitch::E
         config.designAnchorRadialToLeftEndpoint ? (leftDesign.r_mm - generatrix.anchorMeasuredRadiusMm) : 0.0;
     anchorDrMm = refineAnchorDrByStableWindow(generatrix, config, anchorDrMm);
     MeasuredGeneratrixData selectedGeneratrix = applyAcceptedRuns(generatrix, config, anchorDrMm);
+    selectedGeneratrix = trimResidualLeftEndpointTransition(selectedGeneratrix, config, anchorDrMm);
     const EvaluationResult evaluation = runBestFitIfEnabled(selectedGeneratrix, config, anchorDrMm);
     if (!evaluation.ok) {
         result.message =
@@ -1628,31 +2251,23 @@ DesignAlignmentResult compareMeasuredProfileToDesign(const std::vector<stitch::E
 
 cv::Mat buildDesignComparisonPlot(const DesignAlignmentResult& result)
 {
-    const int width = 1320;
-    const int height = 860;
-    const cv::Rect profileRect(90, 90, width - 150, 410);
-    const cv::Rect errorRect(90, 560, width - 150, 210);
+    const int width = 1440;
+    const int height = 920;
+    const cv::Rect profileRect(104, 100, width - 180, 420);
+    const cv::Rect errorRect(104, 586, width - 180, 214);
     cv::Mat canvas(height, width, CV_8UC3, cv::Scalar(255, 255, 255));
 
-    cv::putText(canvas,
-                "Design Generatrix Comparison",
-                cv::Point(36, 48),
-                cv::FONT_HERSHEY_SIMPLEX,
-                1.0,
-                cv::Scalar(35, 35, 35),
-                2,
-                cv::LINE_AA);
-
-    cv::rectangle(canvas, profileRect, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
-    cv::rectangle(canvas, errorRect, cv::Scalar(220, 220, 220), 1, cv::LINE_AA);
+    drawInfoBox(canvas, "Measured-design generatrix comparison", cv::Point(34, 34), 0.66, cv::Scalar(38, 38, 38));
 
     std::vector<cv::Point2d> usedMeasuredSeries;
     std::vector<cv::Point2d> excludedMeasuredSeries;
     std::vector<cv::Point2d> designSeries;
-    std::vector<cv::Point2d> errorSeries;
+    std::vector<cv::Point2d> profileErrorSeries;
+    std::vector<cv::Point2d> normalErrorSeries;
     usedMeasuredSeries.reserve(result.profilePoints.size());
     excludedMeasuredSeries.reserve(result.profilePoints.size());
-    errorSeries.reserve(result.profilePoints.size());
+    profileErrorSeries.reserve(result.profilePoints.size());
+    normalErrorSeries.reserve(result.profilePoints.size());
 
     double minS = std::numeric_limits<double>::infinity();
     double maxS = -std::numeric_limits<double>::infinity();
@@ -1665,13 +2280,16 @@ cv::Mat buildDesignComparisonPlot(const DesignAlignmentResult& result)
         if (point.isUsed) {
             usedMeasuredSeries.push_back(measuredPoint);
             if (std::isfinite(point.designRadiusMm)) {
-                const double errorUm =
-                    result.summary.evaluateProfileForm && std::isfinite(point.profileErrorUm) ? point.profileErrorUm
-                                                                                               : point.normalErrorUm;
-                errorSeries.emplace_back(point.sAlignedMm, errorUm);
+                if (std::isfinite(point.profileErrorUm)) {
+                    profileErrorSeries.emplace_back(point.sAlignedMm, point.profileErrorUm);
+                    maxAbsErrorUm = std::max(maxAbsErrorUm, std::abs(point.profileErrorUm));
+                }
+                if (std::isfinite(point.normalErrorUm)) {
+                    normalErrorSeries.emplace_back(point.sAlignedMm, point.normalErrorUm);
+                    maxAbsErrorUm = std::max(maxAbsErrorUm, std::abs(point.normalErrorUm));
+                }
                 minRadius = std::min(minRadius, std::min(point.rAlignedMm, point.designRadiusMm));
                 maxRadius = std::max(maxRadius, std::max(point.rAlignedMm, point.designRadiusMm));
-                maxAbsErrorUm = std::max(maxAbsErrorUm, std::abs(errorUm));
             }
         } else {
             excludedMeasuredSeries.push_back(measuredPoint);
@@ -1716,18 +2334,33 @@ cv::Mat buildDesignComparisonPlot(const DesignAlignmentResult& result)
     const cv::Scalar usedColor(44, 111, 220);
     const cv::Scalar excludedColor(190, 190, 190);
     const cv::Scalar designColor(36, 157, 81);
-    const cv::Scalar errorColor(43, 120, 209);
-    const cv::Scalar zeroColor(170, 170, 170);
+    const cv::Scalar profileErrorColor(30, 158, 138);
+    const cv::Scalar normalErrorColor(199, 67, 67);
+    const cv::Scalar zeroColor(160, 160, 160);
     const cv::Scalar anchorColor(55, 75, 220);
+
+    drawPlotGrid(canvas, profileRect, minS, maxS, minRadius, maxRadius, 5, 5);
+    drawPlotGrid(canvas, errorRect, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm, 5, 4);
 
     drawScatter(canvas, profileRect, excludedMeasuredSeries, excludedColor, minS, maxS, minRadius, maxRadius, 3);
     drawPolyline(canvas, profileRect, usedMeasuredSeries, usedColor, minS, maxS, minRadius, maxRadius, 2);
     drawPolyline(canvas, profileRect, designSeries, designColor, minS, maxS, minRadius, maxRadius, 2);
-    drawPolyline(canvas, errorRect, errorSeries, errorColor, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm, 2);
+    drawPolyline(canvas, errorRect, profileErrorSeries, profileErrorColor, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm, 2);
+    drawPolyline(canvas, errorRect, normalErrorSeries, normalErrorColor, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm, 1);
 
     const cv::Point zeroBegin = mapPointToRect(errorRect, minS, 0.0, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm);
     const cv::Point zeroEnd = mapPointToRect(errorRect, maxS, 0.0, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm);
     cv::line(canvas, zeroBegin, zeroEnd, zeroColor, 1, cv::LINE_AA);
+
+    if (result.summary.profileStats.p95AbsUm > 0.0) {
+        const double p95 = result.summary.profileStats.p95AbsUm;
+        const cv::Point p95BeginPos = mapPointToRect(errorRect, minS, p95, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm);
+        const cv::Point p95EndPos = mapPointToRect(errorRect, maxS, p95, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm);
+        const cv::Point p95BeginNeg = mapPointToRect(errorRect, minS, -p95, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm);
+        const cv::Point p95EndNeg = mapPointToRect(errorRect, maxS, -p95, minS, maxS, -maxAbsErrorUm, maxAbsErrorUm);
+        cv::line(canvas, p95BeginPos, p95EndPos, cv::Scalar(208, 208, 208), 1, cv::LINE_AA);
+        cv::line(canvas, p95BeginNeg, p95EndNeg, cv::Scalar(208, 208, 208), 1, cv::LINE_AA);
+    }
 
     const auto anchorIt = std::find_if(result.profilePoints.begin(), result.profilePoints.end(), [&result](const auto& point) {
         return std::abs(point.xPx - result.summary.anchorXPx) < 1e-6 &&
@@ -1739,29 +2372,37 @@ cv::Mat buildDesignComparisonPlot(const DesignAlignmentResult& result)
         cv::drawMarker(canvas, anchorPoint, anchorColor, cv::MARKER_CROSS, 18, 2, cv::LINE_AA);
     }
 
-    cv::putText(canvas, "Radius (mm)", cv::Point(18, profileRect.y + 14), cv::FONT_HERSHEY_SIMPLEX, 0.65,
+    cv::putText(canvas, "Radius (mm)", cv::Point(20, profileRect.y - 16), cv::FONT_HERSHEY_SIMPLEX, 0.60,
                 cv::Scalar(90, 90, 90), 1, cv::LINE_AA);
-    cv::putText(canvas, "Form / signed distance error (um)", cv::Point(18, errorRect.y + 14), cv::FONT_HERSHEY_SIMPLEX, 0.65,
+    cv::putText(canvas, "Error (um)", cv::Point(20, errorRect.y - 16), cv::FONT_HERSHEY_SIMPLEX, 0.60,
                 cv::Scalar(90, 90, 90), 1, cv::LINE_AA);
     cv::putText(canvas, "Comparison coordinate s (mm)",
-                cv::Point(profileRect.x + profileRect.width / 2 - 110, height - 24),
+                cv::Point(profileRect.x + profileRect.width / 2 - 110, height - 28),
                 cv::FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.64,
                 cv::Scalar(90, 90, 90),
                 1,
                 cv::LINE_AA);
 
-    cv::line(canvas, cv::Point(width - 360, 60), cv::Point(width - 320, 60), usedColor, 3, cv::LINE_AA);
-    cv::putText(canvas, "Measured generatrix", cv::Point(width - 308, 66), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+    const int legendX = width - 338;
+    const int legendY = 62;
+    cv::line(canvas, cv::Point(legendX, legendY), cv::Point(legendX + 34, legendY), usedColor, 3, cv::LINE_AA);
+    cv::putText(canvas, "Measured contour", cv::Point(legendX + 46, legendY + 5), cv::FONT_HERSHEY_SIMPLEX, 0.52,
                 cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
-    cv::line(canvas, cv::Point(width - 360, 86), cv::Point(width - 320, 86), designColor, 3, cv::LINE_AA);
-    cv::putText(canvas, "Design compare curve", cv::Point(width - 308, 92), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+    cv::line(canvas, cv::Point(legendX, legendY + 24), cv::Point(legendX + 34, legendY + 24), designColor, 3, cv::LINE_AA);
+    cv::putText(canvas, "Design contour", cv::Point(legendX + 46, legendY + 29), cv::FONT_HERSHEY_SIMPLEX, 0.52,
                 cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
-    cv::circle(canvas, cv::Point(width - 340, 112), 4, excludedColor, -1, cv::LINE_AA);
-    cv::putText(canvas, "Filtered end-face / unused", cv::Point(width - 308, 118), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+    cv::line(canvas, cv::Point(legendX, legendY + 48), cv::Point(legendX + 34, legendY + 48), profileErrorColor, 3, cv::LINE_AA);
+    cv::putText(canvas, "Profile-form error", cv::Point(legendX + 46, legendY + 53), cv::FONT_HERSHEY_SIMPLEX, 0.52,
                 cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
-    cv::drawMarker(canvas, cv::Point(width - 340, 138), anchorColor, cv::MARKER_CROSS, 14, 2, cv::LINE_AA);
-    cv::putText(canvas, "Left endpoint anchor", cv::Point(width - 308, 144), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+    cv::line(canvas, cv::Point(legendX, legendY + 72), cv::Point(legendX + 34, legendY + 72), normalErrorColor, 2, cv::LINE_AA);
+    cv::putText(canvas, "Normal error", cv::Point(legendX + 46, legendY + 77), cv::FONT_HERSHEY_SIMPLEX, 0.52,
+                cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+    cv::circle(canvas, cv::Point(legendX + 17, legendY + 96), 4, excludedColor, -1, cv::LINE_AA);
+    cv::putText(canvas, "Excluded samples", cv::Point(legendX + 46, legendY + 101), cv::FONT_HERSHEY_SIMPLEX, 0.52,
+                cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
+    cv::drawMarker(canvas, cv::Point(legendX + 17, legendY + 120), anchorColor, cv::MARKER_CROSS, 14, 2, cv::LINE_AA);
+    cv::putText(canvas, "Anchor sample", cv::Point(legendX + 46, legendY + 125), cv::FONT_HERSHEY_SIMPLEX, 0.52,
                 cv::Scalar(70, 70, 70), 1, cv::LINE_AA);
 
     std::ostringstream info;
@@ -1770,12 +2411,22 @@ cv::Mat buildDesignComparisonPlot(const DesignAlignmentResult& result)
     info << "reverse_z=" << (result.summary.designReverseZ ? 1 : 0)
          << "  dz=" << result.summary.dzMm << " mm"
          << "  dr=" << result.summary.drMm << " mm"
+         << "  abs_rmse=" << result.summary.absoluteFilteredStats.rmseUm << " um"
          << "  offset=" << result.summary.meanNormalErrorUm << " um"
          << "  profile_rms=" << result.summary.profileStats.rmseUm << " um"
          << "  profile_p95=" << result.summary.profileStats.p95AbsUm << " um"
          << "  N=" << result.summary.usedCount;
-    cv::putText(canvas, info.str(), cv::Point(36, 820), cv::FONT_HERSHEY_SIMPLEX, 0.68, cv::Scalar(55, 55, 55), 1,
-                cv::LINE_AA);
+    drawInfoBox(canvas, info.str(), cv::Point(34, 844), 0.48, cv::Scalar(60, 60, 60));
+
+    if (result.summary.appliedAbsoluteBiasRefine) {
+        std::ostringstream refineInfo;
+        refineInfo.setf(std::ios::fixed);
+        refineInfo.precision(3);
+        refineInfo << "bias refine " << result.summary.preRefineMeanNormalErrorUm
+                   << " -> " << result.summary.meanNormalErrorUm
+                   << " um  (dr correction " << result.summary.absoluteBiasCorrectionUm << " um)";
+        drawInfoBox(canvas, refineInfo.str(), cv::Point(34, 874), 0.45, cv::Scalar(86, 86, 86));
+    }
 
     return canvas;
 }

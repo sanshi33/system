@@ -23,11 +23,18 @@ void initCanvasAndPlaceFirst(const Mat &first_img, Mat &canvas, Mat &M_global)
 void applyTransformAndBlend(const Mat &img_next, Mat &canvas, Mat &M_global,
                             const Point2d &center, const TransformResult &res)
 {
-    Mat M_rot_2x3 = getRotationMatrix2D(center, res.da, 1.0);
     Mat M_rel = Mat::eye(3, 3, CV_64F);
-    M_rot_2x3.copyTo(M_rel(Rect(0, 0, 3, 2)));
-    M_rel.at<double>(0, 2) += res.dx;
-    M_rel.at<double>(1, 2) += res.dy;
+    if (res.hasCustomRelativeMatrix &&
+        !res.customRelativeMatrix.empty() &&
+        res.customRelativeMatrix.rows == 3 &&
+        res.customRelativeMatrix.cols == 3) {
+        M_rel = res.customRelativeMatrix.clone();
+    } else {
+        Mat M_rot_2x3 = getRotationMatrix2D(center, res.da, 1.0);
+        M_rot_2x3.copyTo(M_rel(Rect(0, 0, 3, 2)));
+        M_rel.at<double>(0, 2) += res.dx;
+        M_rel.at<double>(1, 2) += res.dy;
+    }
 
     M_global = M_global * M_rel;
     Mat M_draw = M_global.rowRange(0, 2);

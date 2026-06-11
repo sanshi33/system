@@ -72,13 +72,19 @@ struct EdgeVariants {
     std::vector<double> rawConfidences;
     std::vector<double> rawGradients;
     std::vector<unsigned char> rawSyntheticFlags;
+    std::vector<cv::Point2d> unfiltered_raw;
     std::vector<cv::Point2d> x_sorted;
     std::vector<cv::Point2d> y_sorted;
     std::vector<cv::Point2d> negX_sorted;
     std::vector<cv::Point2d> negY_sorted;
+    std::vector<cv::Point2d> unfiltered_x_sorted;
+    std::vector<cv::Point2d> unfiltered_y_sorted;
+    std::vector<cv::Point2d> unfiltered_negX_sorted;
+    std::vector<cv::Point2d> unfiltered_negY_sorted;
 
     [[nodiscard]] bool empty() const noexcept { return raw.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return raw.size(); }
+    [[nodiscard]] bool hasUnfiltered() const noexcept { return !unfiltered_raw.empty(); }
 
     [[nodiscard]] const std::vector<cv::Point2d>& ordered(AlignmentAxis axis) const noexcept
     {
@@ -160,6 +166,7 @@ struct TransformResult {
     double dx{0.0};
     double dy{0.0};
     double da{0.0};
+    double shearPrimaryToNormal{0.0};
     double score{1e9};
     double normalMatchCost{0.0};
     double tangentResidualMatchCost{0.0};
@@ -167,6 +174,8 @@ struct TransformResult {
     double directionPenaltyMatchCost{0.0};
     AlignmentAxis axis{AlignmentAxis::X};
     std::string direction;
+    bool hasCustomRelativeMatrix{false};
+    cv::Mat customRelativeMatrix;
     std::vector<double> inlierErrors;
     std::vector<double> inlierCoordinates;
     std::vector<double> samplePrimaryCoordinates;
@@ -188,8 +197,33 @@ struct StitchStepRecord {
     std::size_t stepIndex{0};
     std::size_t referenceImageIndex{0};
     std::size_t targetImageIndex{0};
+    AlignmentAxis motionAxis{AlignmentAxis::X};
+    double primaryImageSpanPx{0.0};
     double searchRangeX{0.0};
     double searchRangeY{0.0};
+    std::string selectionMode{"direct_match"};
+    bool hasNominalPrior{false};
+    double nominalPriorDx{0.0};
+    double nominalPriorDy{0.0};
+    bool hasPairPrior{false};
+    double pairPriorDx{0.0};
+    double pairPriorDy{0.0};
+    double pairPriorAngleDeg{0.0};
+    bool hasTrajectoryPrior{false};
+    double trajectoryPriorDx{0.0};
+    double trajectoryPriorDy{0.0};
+    double trajectoryPriorAngleDeg{0.0};
+    bool hasImageCorrelationEstimate{false};
+    double imageCorrelationDx{0.0};
+    double imageCorrelationDy{0.0};
+    double imageCorrelationScore{0.0};
+    bool usedWideSearchRescue{false};
+    bool usedQualityLocalRescan{false};
+    bool usedCandidateReselect{false};
+    bool usedUnfilteredEdgeRescue{false};
+    bool usedTrajectoryPriorRescue{false};
+    bool usedMotionPriorFallback{false};
+    bool usedForcedTrajectoryPriorFallback{false};
     TransformResult transform;
 };
 
@@ -233,6 +267,8 @@ struct StitchPipelineConfig {
     double translationPriorFallbackScoreThreshold = 1e8; ///< 触发平移先验兜底的 score 阈值。
     bool generateDebugVisualization = false; ///< 是否生成过程调试图。
     bool enableDesignComparison = true; ///< 是否执行设计母线比对。
+    bool endpointProbeFastMode = false; ///< 是否启用最后一步 endpoint 快速探测模式。
+    bool enableLastStepReferencePriorHalfOverlapProbe = false; ///< 是否启用最后一步“上一张位移先验 + 50% 重叠区”专项探测。
     bool designEvaluateProfileForm = true; ///< 是否基于去均值后的法向残差评价轮廓波动。
     bool designReverseZ = true; ///< 实测从左到右是否对应原始设计 z 从大到小。
     bool designUseLeftEndpointAnchor = true; ///< 是否使用左端点作为轴向锚点。
@@ -259,6 +295,9 @@ struct StitchPipelineConfig {
     int designSlopeWindow = 7; ///< 局部斜率估计滑窗长度。
     double designTrimLeftAfterEndpointMm = 0.0; ///< 左端点后额外裁掉的长度。
     double designTrimRightMm = 0.0; ///< 右端额外裁掉的长度。
+    bool designIgnoreStepTransition = true; ///< 是否忽略台阶过渡区，避免其影响设计比对优化与统计。
+    double designStepTransitionOriginalZMm = 119.0; ///< 台阶过渡在原始设计 z 坐标中的中心位置。
+    double designStepTransitionHalfWidthMm = 0.35; ///< 台阶过渡区在轴向上的半宽；默认仅忽略台阶段极窄核心，避免整段中部被过度删点。
 };
 
 /**
@@ -266,10 +305,26 @@ struct StitchPipelineConfig {
  */
 struct StitchRunCache;
 
+struct StandardCircleRunConfig {
+    bool enabled{false};
+    int startIndex{1};
+    std::string imagePrefix{"Pic_"};
+    std::string imageExtension{".bmp"};
+    double sphereDiameterMm{19.99995};
+    double horizontalFieldOfViewMm{40.0};
+    double verticalFieldOfViewMm{30.0};
+    double overlapRatio{0.70};
+    double windowHalfSizePx{60.0};
+    double windowHalfAngleDeg{7.0};
+    int circularMedianFilterRadius{10};
+    double circularFilterBlend{0.95};
+};
+
 struct StitchRunRequest {
     std::vector<std::string> imagePaths;
     EdgeDetectConfig edgeConfig{};
     StitchPipelineConfig pipelineConfig{};
+    StandardCircleRunConfig standardCircleConfig{};
     std::string resultOutputDir;
     std::string panoramaOutputPath;
     std::string csvOutputPath;

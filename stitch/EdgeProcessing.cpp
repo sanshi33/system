@@ -16,13 +16,11 @@ namespace {
 
 using SubpixelEdge::SubpixelPoint;
 
-// 将分位数参数限制在 [0, 1]，同时兼容外部传入的边界值。
 double clampUnitQuantile(double value)
 {
     return std::clamp(value, 0.0, 1.0);
 }
 
-// 使用 nth_element 计算分位数，避免为简单阈值计算做完整排序。
 double computeQuantile(std::vector<double> values, double q)
 {
     if (values.empty()) {
@@ -36,7 +34,6 @@ double computeQuantile(std::vector<double> values, double q)
     return values[index];
 }
 
-// 先剔除坐标、置信度或梯度中出现 NaN / Inf 的异常点。
 std::vector<SubpixelPoint> collectFinitePoints(const std::vector<SubpixelPoint>& points)
 {
     std::vector<SubpixelPoint> filtered;
@@ -53,7 +50,6 @@ std::vector<SubpixelPoint> collectFinitePoints(const std::vector<SubpixelPoint>&
     return filtered;
 }
 
-// 先按置信度和梯度分位数做一次轻量预筛，过滤明显弱点。
 std::vector<SubpixelPoint> applyQualityPrefilter(std::vector<SubpixelPoint> points,
                                                  const EdgeDetectConfig& cfg)
 {
@@ -96,7 +92,6 @@ std::vector<SubpixelPoint> applyQualityPrefilter(std::vector<SubpixelPoint> poin
     return filtered;
 }
 
-// 在局部窗口内排除当前点后拟合一条直线，用于估计该点的局部参考趋势。
 bool fitLocalLineExcludingIndex(const std::vector<SubpixelPoint>& points,
                                 int start,
                                 int end,
@@ -138,7 +133,6 @@ bool fitLocalLineExcludingIndex(const std::vector<SubpixelPoint>& points,
     return std::isfinite(slope) && std::isfinite(intercept);
 }
 
-// 对按 X 排序后的亚像素点做局部线性 Hampel 判异，只剔除毛刺点，不平滑保留点坐标。
 std::vector<SubpixelPoint> applyLocalLinearHampel(std::vector<SubpixelPoint> points,
                                                   const EdgeDetectConfig& cfg)
 {
@@ -220,7 +214,6 @@ std::vector<SubpixelPoint> applyLocalLinearHampel(std::vector<SubpixelPoint> poi
     return filtered;
 }
 
-// 转成当前拼接流程统一使用的 Point2d 表示。
 std::vector<cv::Point2d> toCvPoints(const std::vector<SubpixelPoint>& points)
 {
     std::vector<cv::Point2d> edges;
@@ -267,54 +260,58 @@ void fillPointQuality(const std::vector<SubpixelPoint>& points, EdgeVariants& ev
     }
 }
 
-// 汇总亚像素点前置滤波流程：有限值检查 -> 质量预筛 -> Hampel 离群点剔除。
-std::vector<cv::Point2d> filterSubpixelEdges(const std::vector<SubpixelPoint>& detectedPoints,
-                                             const EdgeDetectConfig& cfg)
+void fillOrderedViews(const std::vector<cv::Point2d>& rawPoints,
+                      std::vector<cv::Point2d>& xSorted,
+                      std::vector<cv::Point2d>& ySorted,
+                      std::vector<cv::Point2d>& negXSorted,
+                      std::vector<cv::Point2d>& negYSorted)
 {
-    std::vector<SubpixelPoint> filtered = collectFinitePoints(detectedPoints);
-    if (!cfg.enablePointFiltering || filtered.empty()) {
-        return toCvPoints(filtered);
-    }
+    xSorted = rawPoints;
+    ySorted = rawPoints;
+    negXSorted = rawPoints;
+    negYSorted = rawPoints;
 
-    filtered = applyQualityPrefilter(std::move(filtered), cfg);
-    filtered = applyLocalLinearHampel(std::move(filtered), cfg);
-    return toCvPoints(filtered);
+    sortContourByX(xSorted);
+    sortContourByY(ySorted);
+
+    for (auto& point : negXSorted) {
+        point.x = -point.x;
+    }
+    sortContourByX(negXSorted);
+
+    for (auto& point : negYSorted) {
+        point.y = -point.y;
+    }
+    sortContourByY(negYSorted);
 }
 
 } // namespace
 
-EdgeVariants buildEdgeVariants(SubpixelEdgeDetector &det,
-                               const cv::Mat &img,
-                               const EdgeDetectConfig &cfg)
+EdgeVariants buildEdgeVariants(SubpixelEdgeDetector& det,
+                               const cv::Mat& img,
+                               const EdgeDetectConfig& cfg)
 {
     det.setImage(img);
     det.detectCannyEdges(cfg.cannyLow, cfg.cannyHigh);
     det.refineEdgesSubpixel(cfg.subpixWindow, cfg.subpixSigma);
 
-    EdgeVariants ev;
-    // 这里是“边缘检测之后、拼接之前”的唯一入口，适合放点级清洗。
-    std::vector<SubpixelPoint> filtered = collectFinitePoints(det.getSubpixelPoints());
-    if (cfg.enablePointFiltering && !filtered.empty()) {
-        filtered = applyQualityPrefilter(std::move(filtered), cfg);
-        filtered = applyLocalLinearHampel(std::move(filtered), cfg);
+    std::vector<SubpixelPoint> finitePoints = collectFinitePoints(det.getSubpixelPoints());
+    std::vector<SubpixelPoint> filteredPoints = finitePoints;
+    if (cfg.enablePointFiltering && !filteredPoints.empty()) {
+        filteredPoints = applyQualityPrefilter(std::move(filteredPoints), cfg);
+        filteredPoints = applyLocalLinearHampel(std::move(filteredPoints), cfg);
     }
-    fillPointQuality(filtered, ev);
 
-    ev.x_sorted = ev.raw;
-    ev.y_sorted = ev.raw;
-    ev.negX_sorted = ev.raw;
-    ev.negY_sorted = ev.raw;
+    EdgeVariants ev;
+    fillPointQuality(filteredPoints, ev);
+    ev.unfiltered_raw = toCvPoints(finitePoints);
 
-    sortContourByX(ev.x_sorted);
-    sortContourByY(ev.y_sorted);
-
-    for (auto &p : ev.negX_sorted)
-        p.x = -p.x;
-    sortContourByX(ev.negX_sorted);
-
-    for (auto &p : ev.negY_sorted)
-        p.y = -p.y;
-    sortContourByY(ev.negY_sorted);
+    fillOrderedViews(ev.raw, ev.x_sorted, ev.y_sorted, ev.negX_sorted, ev.negY_sorted);
+    fillOrderedViews(ev.unfiltered_raw,
+                     ev.unfiltered_x_sorted,
+                     ev.unfiltered_y_sorted,
+                     ev.unfiltered_negX_sorted,
+                     ev.unfiltered_negY_sorted);
 
     return ev;
 }

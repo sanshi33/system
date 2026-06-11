@@ -19,8 +19,7 @@ cv::Mat buildDebugStepVisualization(const cv::Mat& imgRef,
                                     const cv::Mat& imgTarget,
                                     const std::vector<cv::Point2d>& edgesRef,
                                     const std::vector<cv::Point2d>& edgesTarget,
-                                    const TransformResult& result,
-                                    int stepIndex);
+                                    const StitchStepRecord& step);
 
 /**
  * @brief 生成单张图像在预处理阶段的边缘预览图。

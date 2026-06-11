@@ -315,6 +315,7 @@ if(PINJIE_BUILD_GUI)
             Qt6::Gui
             Qt6::Widgets
     )
+    add_dependencies(pinjie_gui standard_sphere_loop_eval)
     if(PINJIE_GALAXY_CAMERA_TARGET)
         target_link_libraries(pinjie_gui PRIVATE ${PINJIE_GALAXY_CAMERA_TARGET})
     endif()

@@ -73,6 +73,97 @@ double computeCoverageRatio(double span, double referenceSpan)
     return std::clamp(span / referenceSpan, 0.0, 1.0);
 }
 
+double preferredNormalRmse(const AlignmentMetrics& metrics)
+{
+    const ResidualStatistics& normal = metrics.normalInlier.valid() ? metrics.normalInlier : metrics.normalAll;
+    return normal.valid() ? normal.rmse : std::numeric_limits<double>::infinity();
+}
+
+double preferredTangentRmse(const AlignmentMetrics& metrics)
+{
+    const ResidualStatistics& tangent = metrics.tangentInlier.valid() ? metrics.tangentInlier : metrics.tangentAll;
+    return tangent.valid() ? tangent.rmse : 0.0;
+}
+
+double preferredCoverageRatio(const AlignmentMetrics& metrics)
+{
+    if (metrics.inlierCount > 0) {
+        return metrics.inlierCoverageRatio;
+    }
+    return metrics.overlapCoverageRatio;
+}
+
+double preferredTangentCorrelation(const AlignmentMetrics& metrics)
+{
+    return metrics.tangentInlier.valid() ? metrics.tangentCorrInlier : metrics.tangentCorrAll;
+}
+
+double primaryShiftDeltaPx(AlignmentAxis axis,
+                           double dx,
+                           double dy,
+                           double approxShift,
+                           double approxShiftY)
+{
+    return axis == AlignmentAxis::X ? dx - approxShift : dy - approxShiftY;
+}
+
+double perpendicularShiftDeltaPx(AlignmentAxis axis,
+                                 double dx,
+                                 double dy,
+                                 double approxShift,
+                                 double approxShiftY)
+{
+    return axis == AlignmentAxis::X ? dy - approxShiftY : dx - approxShift;
+}
+
+double diagnosticSelectionCost(const AlignmentCandidateDiagnostic& candidate,
+                               double approxShift,
+                               double approxShiftY)
+{
+    const double normalRmse = preferredNormalRmse(candidate.metrics);
+    if (!std::isfinite(normalRmse)) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const double tangentRmse = preferredTangentRmse(candidate.metrics);
+    const double primaryDelta =
+        primaryShiftDeltaPx(candidate.axis, candidate.dx, candidate.dy, approxShift, approxShiftY);
+    const double perpDelta =
+        perpendicularShiftDeltaPx(candidate.axis, candidate.dx, candidate.dy, approxShift, approxShiftY);
+    const double priorCost =
+        (primaryDelta * primaryDelta) / (40.0 * 40.0) +
+        (perpDelta * perpDelta) / (16.0 * 16.0);
+    const double angleCost = (candidate.da * candidate.da) / (0.2 * 0.2);
+    return normalRmse * normalRmse +
+           0.05 * tangentRmse * tangentRmse +
+           0.01 * priorCost +
+           0.008 * angleCost;
+}
+
+double transformSelectionCost(const TransformResult& result,
+                              double approxShift,
+                              double approxShiftY)
+{
+    const double normalRmse = preferredNormalRmse(result.metrics);
+    if (!std::isfinite(normalRmse)) {
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const double tangentRmse = preferredTangentRmse(result.metrics);
+    const double primaryDelta =
+        primaryShiftDeltaPx(result.axis, result.dx, result.dy, approxShift, approxShiftY);
+    const double perpDelta =
+        perpendicularShiftDeltaPx(result.axis, result.dx, result.dy, approxShift, approxShiftY);
+    const double priorCost =
+        (primaryDelta * primaryDelta) / (40.0 * 40.0) +
+        (perpDelta * perpDelta) / (16.0 * 16.0);
+    const double angleCost = (result.da * result.da) / (0.2 * 0.2);
+    return normalRmse * normalRmse +
+           0.05 * tangentRmse * tangentRmse +
+           0.01 * priorCost +
+           0.008 * angleCost;
+}
+
 vector<unsigned char> computeOverlapCoreMask(const vector<double>& primaryValues)
 {
     vector<unsigned char> mask(primaryValues.size(), 1);
@@ -921,9 +1012,20 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
 
     const double approx_x_local = std::abs(approx_shift);
     const double approx_y_local = std::abs(approx_shift_y);
+    const bool hasFixedDirectionPrior = direction_constraint != MotionPriorDirection::Auto;
+    const bool fixedDirectionUsesPrimaryX =
+        direction_constraint == MotionPriorDirection::XPositive ||
+        direction_constraint == MotionPriorDirection::XNegative;
     if (strict_local_prior_window) {
         search_range_x = std::max(1.0, local_primary_search_half_range_px);
         search_range_y = std::max(1.0, local_perp_search_half_range_px);
+    } else if (hasFixedDirectionPrior) {
+        // 对单向采集的工件，首轮围绕先验位移做有限搜索即可，
+        // 避免把 expected shift 误放大成近两倍跨度的大范围暴力扫描。
+        const double fixedPrimarySearchRange = std::max(1.0, base_search_range);
+        const double fixedPerpSearchRange = std::clamp(base_search_range * 0.30, 12.0, 60.0);
+        search_range_x = fixedDirectionUsesPrimaryX ? fixedPrimarySearchRange : fixedPerpSearchRange;
+        search_range_y = fixedDirectionUsesPrimaryX ? fixedPerpSearchRange : fixedPrimarySearchRange;
     } else {
         search_range_x = std::max(base_search_range, approx_x_local * 2.0);
         search_range_y = std::max(base_search_range, approx_y_local * 2.0);
@@ -932,6 +1034,8 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
     const auto directionAllowed = [&](MotionPriorDirection candidate) {
         return direction_constraint == MotionPriorDirection::Auto || direction_constraint == candidate;
     };
+
+    bool nearStraightSegment = false;
 
     vector<AlignmentCandidateDiagnostic> candidateDiagnostics;
     const auto captureCandidate = [&](const char* label, const TransformResult& cand)
@@ -991,9 +1095,19 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
 
     auto apply_motion_continuity_penalty = [&](TransformResult& cand)
     {
-        constexpr double kPenaltyWeight = 0.02;
-        const double primaryTolerancePx = std::max(40.0, base_search_range * 0.4);
-        const double perpTolerancePx = std::max(8.0, base_search_range * 0.075);
+        double penaltyWeight = 0.02;
+        double primaryTolerancePx = std::max(40.0, base_search_range * 0.4);
+        double perpTolerancePx = std::max(8.0, base_search_range * 0.075);
+
+        if (strict_local_prior_window) {
+            penaltyWeight = has_reliable_motion_prior ? 0.08 : 0.06;
+            primaryTolerancePx = std::clamp(local_primary_search_half_range_px * 0.25, 3.5, 10.0);
+            perpTolerancePx = std::clamp(local_perp_search_half_range_px * 0.45, 2.0, 6.0);
+        } else if (has_reliable_motion_prior || hasFixedDirectionPrior) {
+            penaltyWeight = has_reliable_motion_prior ? 0.05 : 0.035;
+            primaryTolerancePx = std::clamp(base_search_range * 0.06, 8.0, 18.0);
+            perpTolerancePx = std::clamp(base_search_range * 0.03, 3.0, 8.0);
+        }
 
         const auto addSoftPenalty = [&](const double deltaPx, const double tolerancePx) {
             const double excessPx = std::max(0.0, std::abs(deltaPx) - tolerancePx);
@@ -1001,7 +1115,7 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                 return 0.0;
             }
             const double normalized = excessPx / tolerancePx;
-            return kPenaltyWeight * normalized * normalized;
+            return penaltyWeight * normalized * normalized;
         };
 
         double penalty = 0.0;
@@ -1045,10 +1159,23 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
             }
         }
         if (maxCurvature < 0.001) {
+            nearStraightSegment = true;
             rotationMin = 0.0;
             rotationMax = 0.0;
             rotationStep = 1.0; // 单次迭代，角度=0°
         }
+    }
+
+    if (nearStraightSegment) {
+        const double straightSegmentHalfWindowDeg = 0.03;
+        rotationMin = std::max(rotation_search_min_deg, approx_angle_deg - straightSegmentHalfWindowDeg);
+        rotationMax = std::min(rotation_search_max_deg, approx_angle_deg + straightSegmentHalfWindowDeg);
+        if (rotationMin > rotationMax) {
+            rotationMin = approx_angle_deg;
+            rotationMax = approx_angle_deg;
+        }
+        const double baseRotationStep = rotation_search_step_deg > 0.0 ? rotation_search_step_deg : 0.01;
+        rotationStep = std::min(baseRotationStep, 0.005);
     }
 
     for (double ang = rotationMin; ang <= rotationMax + 1e-12; ang += rotationStep)
@@ -1287,6 +1414,172 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                 res.direction = winnerLabel;
                 search_range_x = fallbackSearchRangeX;
                 search_range_y = fallbackSearchRangeY;
+            }
+        }
+    }
+
+    if (res.hasCandidate() && !candidateDiagnostics.empty()) {
+        const double currentNormal = preferredNormalRmse(res.metrics);
+        const double currentCoverage = preferredCoverageRatio(res.metrics);
+        const double currentCorrelation = preferredTangentCorrelation(res.metrics);
+        const double currentSelectionCost = transformSelectionCost(res, approx_shift, approx_shift_y);
+        const bool loosePromotionMode = currentNormal > 0.35 || res.score > 1.0;
+        const double scoreWindow =
+            loosePromotionMode ? std::numeric_limits<double>::infinity() : (res.score + 0.15);
+        const double maxPrimaryJumpPx = loosePromotionMode ? 320.0 : (has_reliable_motion_prior ? 42.0 : 90.0);
+        const double maxPerpJumpPx = loosePromotionMode ? 60.0 : 24.0;
+        const double currentPrimaryShift = res.axis == AlignmentAxis::X ? res.dx : res.dy;
+        const double currentPerpShift = res.axis == AlignmentAxis::X ? res.dy : res.dx;
+
+        const AlignmentCandidateDiagnostic* promotedCandidate = nullptr;
+        double bestNormal = currentNormal;
+        double bestCost = currentSelectionCost;
+        for (const AlignmentCandidateDiagnostic& candidate : candidateDiagnostics) {
+            if (candidate.axis != res.axis) {
+                continue;
+            }
+
+            const double normalRmse = preferredNormalRmse(candidate.metrics);
+            if (!std::isfinite(normalRmse)) {
+                continue;
+            }
+
+            const double coverage = preferredCoverageRatio(candidate.metrics);
+            if (coverage + 0.04 < currentCoverage) {
+                continue;
+            }
+
+            const double tangentCorrelation = preferredTangentCorrelation(candidate.metrics);
+            if (tangentCorrelation + 0.015 < currentCorrelation) {
+                continue;
+            }
+
+            if (std::isfinite(scoreWindow) && candidate.score > scoreWindow) {
+                continue;
+            }
+
+            const double candidatePrimaryShift = candidate.axis == AlignmentAxis::X ? candidate.dx : candidate.dy;
+            const double candidatePerpShift = candidate.axis == AlignmentAxis::X ? candidate.dy : candidate.dx;
+            if (std::abs(candidatePrimaryShift - currentPrimaryShift) > maxPrimaryJumpPx ||
+                std::abs(candidatePerpShift - currentPerpShift) > maxPerpJumpPx) {
+                continue;
+            }
+
+            const double cost = diagnosticSelectionCost(candidate, approx_shift, approx_shift_y);
+            const bool betterNormal = normalRmse < bestNormal - 0.005;
+            const bool sameNormalButBetterCost =
+                std::abs(normalRmse - bestNormal) <= 0.005 && cost < bestCost;
+            if (betterNormal || sameNormalButBetterCost) {
+                promotedCandidate = &candidate;
+                bestNormal = normalRmse;
+                bestCost = cost;
+            }
+        }
+
+        const bool shouldPromoteCandidate =
+            promotedCandidate != nullptr &&
+            (bestNormal + 0.015 < currentNormal ||
+             bestCost < currentSelectionCost * 0.92 ||
+             (loosePromotionMode && bestNormal < currentNormal * 0.8));
+
+        if (shouldPromoteCandidate) {
+            const auto rebuildCandidateTransform = [&](const AlignmentCandidateDiagnostic& candidate) {
+                TransformResult rebuilt;
+                rebuilt.score = 1e9;
+                const double refineSearchHalfRangePx = 6.0;
+
+                vector<Point2d> rotated_edges2;
+                rotatePoints(next_edges.raw, rotated_edges2, candidate.da, center);
+                sortContourByX(rotated_edges2);
+
+                vector<Point2d> rotated_edges2_y = rotated_edges2;
+                sortContourByY(rotated_edges2_y);
+
+                const Point2d centerNegX(-center.x, center.y);
+                vector<Point2d> rotated_edges2_negX;
+                rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, candidate.da, centerNegX);
+                sortContourByX(rotated_edges2_negX);
+
+                const Point2d centerNegY(center.x, -center.y);
+                vector<Point2d> rotated_edges2_negY;
+                rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, candidate.da, centerNegY);
+                sortContourByY(rotated_edges2_negY);
+
+                if (candidate.direction == "X+") {
+                    const double maxPerpThreshold =
+                        std::max(resolveMaxPerpThreshold(AlignmentAxis::X), std::abs(candidate.dy) + 6.0);
+                    rebuilt = computeGlobalAlignment(prev_edges.x_sorted,
+                                                     rotated_edges2,
+                                                     candidate.dx,
+                                                     refineSearchHalfRangePx,
+                                                     maxPerpThreshold,
+                                                     TransformResult::AlignAxis::X,
+                                                     tangent_residual_cost_weight,
+                                                     tangent_correlation_cost_weight);
+                    rebuilt.da = candidate.da;
+                    populateAlignmentMetrics(prev_edges.x_sorted, rotated_edges2, rebuilt);
+                } else if (candidate.direction == "X-") {
+                    const double maxPerpThreshold =
+                        std::max(resolveMaxPerpThreshold(AlignmentAxis::X), std::abs(candidate.dy) + 6.0);
+                    rebuilt = computeGlobalAlignment(prev_edges.negX_sorted,
+                                                     rotated_edges2_negX,
+                                                     -candidate.dx,
+                                                     refineSearchHalfRangePx,
+                                                     maxPerpThreshold,
+                                                     TransformResult::AlignAxis::X,
+                                                     tangent_residual_cost_weight,
+                                                     tangent_correlation_cost_weight);
+                    rebuilt.dx = -rebuilt.dx;
+                    rebuilt.da = candidate.da;
+                    populateAlignmentMetrics(prev_edges.x_sorted, rotated_edges2, rebuilt);
+                } else if (candidate.direction == "Y+") {
+                    const double maxPerpThreshold =
+                        std::max(resolveMaxPerpThreshold(AlignmentAxis::Y), std::abs(candidate.dx) + 6.0);
+                    rebuilt = computeGlobalAlignment(prev_edges.y_sorted,
+                                                     rotated_edges2_y,
+                                                     candidate.dy,
+                                                     refineSearchHalfRangePx,
+                                                     maxPerpThreshold,
+                                                     TransformResult::AlignAxis::Y,
+                                                     tangent_residual_cost_weight,
+                                                     tangent_correlation_cost_weight);
+                    rebuilt.da = candidate.da;
+                    populateAlignmentMetrics(prev_edges.y_sorted, rotated_edges2_y, rebuilt);
+                } else if (candidate.direction == "Y-") {
+                    const double maxPerpThreshold =
+                        std::max(resolveMaxPerpThreshold(AlignmentAxis::Y), std::abs(candidate.dx) + 6.0);
+                    rebuilt = computeGlobalAlignment(prev_edges.negY_sorted,
+                                                     rotated_edges2_negY,
+                                                     -candidate.dy,
+                                                     refineSearchHalfRangePx,
+                                                     maxPerpThreshold,
+                                                     TransformResult::AlignAxis::Y,
+                                                     tangent_residual_cost_weight,
+                                                     tangent_correlation_cost_weight);
+                    rebuilt.dy = -rebuilt.dy;
+                    rebuilt.da = candidate.da;
+                    populateAlignmentMetrics(prev_edges.y_sorted, rotated_edges2_y, rebuilt);
+                }
+
+                if (rebuilt.hasCandidate()) {
+                    apply_direction_penalty(rebuilt);
+                    apply_motion_continuity_penalty(rebuilt);
+                    rebuilt.direction = candidate.direction;
+                }
+
+                return rebuilt;
+            };
+
+            TransformResult rebuiltCandidate = rebuildCandidateTransform(*promotedCandidate);
+            const double rebuiltNormal = preferredNormalRmse(rebuiltCandidate.metrics);
+            const double rebuiltCoverage = preferredCoverageRatio(rebuiltCandidate.metrics);
+            const double rebuiltCost = transformSelectionCost(rebuiltCandidate, approx_shift, approx_shift_y);
+            if (rebuiltCandidate.hasCandidate() &&
+                std::isfinite(rebuiltNormal) &&
+                rebuiltCoverage + 0.04 >= currentCoverage &&
+                (rebuiltNormal + 0.015 < currentNormal ||
+                 rebuiltCost < currentSelectionCost * 0.92)) {
+                res = std::move(rebuiltCandidate);
             }
         }
     }

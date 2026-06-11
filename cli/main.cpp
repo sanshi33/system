@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -16,6 +17,25 @@ namespace
 
     const std::string kDefaultInputDir = u8"D:/VSCode_Project/pinjie/\u706b\u7130\u7b52/\u6bcd\u7ebf\u62fc\u63a5/";
     constexpr int kDefaultImageCount = 2;
+
+    enum class CliPreset
+    {
+        Gui,
+        PinjieCliLegacy,
+        StitchAppLegacy,
+    };
+
+    enum class ImageCollectionMode
+    {
+        SequentialPicBmp,
+        ScanAllNatural,
+    };
+
+    enum class CliRunMode
+    {
+        Full,
+        Registration,
+    };
 
     std::string toLowerAscii(std::string value)
     {
@@ -86,11 +106,244 @@ namespace
         return false;
     }
 
+    bool parseCliPreset(const std::string &text, CliPreset &preset)
+    {
+        const std::string normalized = toLowerAscii(text);
+        if (normalized == "gui" || normalized == "gui-like" || normalized == "gui_compatible")
+        {
+            preset = CliPreset::Gui;
+            return true;
+        }
+        if (normalized == "pinjie-cli" || normalized == "pinjie_cli" || normalized == "cli-legacy")
+        {
+            preset = CliPreset::PinjieCliLegacy;
+            return true;
+        }
+        if (normalized == "stitch-app" || normalized == "stitch_app" || normalized == "legacy-cli")
+        {
+            preset = CliPreset::StitchAppLegacy;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool parseCliRunMode(const std::string &text, CliRunMode &mode)
+    {
+        const std::string normalized = toLowerAscii(text);
+        if (normalized == "full")
+        {
+            mode = CliRunMode::Full;
+            return true;
+        }
+        if (normalized == "registration" || normalized == "register" || normalized == "reg")
+        {
+            mode = CliRunMode::Registration;
+            return true;
+        }
+
+        return false;
+    }
+
+    const char *cliPresetName(CliPreset preset)
+    {
+        switch (preset)
+        {
+        case CliPreset::Gui:
+            return "gui";
+        case CliPreset::PinjieCliLegacy:
+            return "pinjie-cli";
+        case CliPreset::StitchAppLegacy:
+            return "stitch-app";
+        }
+
+        return "gui";
+    }
+
+    const char *cliRunModeName(CliRunMode mode)
+    {
+        switch (mode)
+        {
+        case CliRunMode::Registration:
+            return "registration";
+        case CliRunMode::Full:
+        default:
+            return "full";
+        }
+    }
+
+    void applyCliPreset(CliPreset preset,
+                        double &overlapRatio,
+                        double &baseSearchRange,
+                        double &rotationMinDeg,
+                        double &rotationMaxDeg,
+                        double &rotationStepDeg,
+                        double &tangentResidualWeight,
+                        double &tangentCorrelationWeight,
+                        bool &enablePointFiltering,
+                        double &filterConfidenceQuantile,
+                        double &filterGradientQuantile,
+                        int &filterWindowRadius,
+                        double &filterHampelSigma,
+                        double &filterHampelMinScale,
+                        pinjie::MotionPriorDirection &directionConstraint,
+                        ImageCollectionMode &imageCollectionMode)
+    {
+        overlapRatio = 0.875;
+        tangentResidualWeight = 0.05;
+        tangentCorrelationWeight = 0.25;
+        enablePointFiltering = true;
+        filterConfidenceQuantile = 0.15;
+        filterGradientQuantile = 0.15;
+        filterWindowRadius = 5;
+        filterHampelSigma = 3.0;
+        filterHampelMinScale = 0.05;
+        directionConstraint = pinjie::MotionPriorDirection::XPositive;
+
+        switch (preset)
+        {
+        case CliPreset::Gui:
+            baseSearchRange = 200.0;
+            rotationMinDeg = -0.5;
+            rotationMaxDeg = 0.5;
+            rotationStepDeg = 0.01;
+            imageCollectionMode = ImageCollectionMode::ScanAllNatural;
+            break;
+        case CliPreset::PinjieCliLegacy:
+            baseSearchRange = 200.0;
+            rotationMinDeg = -1.0;
+            rotationMaxDeg = 1.0;
+            rotationStepDeg = 0.05;
+            imageCollectionMode = ImageCollectionMode::SequentialPicBmp;
+            break;
+        case CliPreset::StitchAppLegacy:
+            baseSearchRange = 3000.0;
+            rotationMinDeg = -1.0;
+            rotationMaxDeg = 1.0;
+            rotationStepDeg = 0.05;
+            imageCollectionMode = ImageCollectionMode::SequentialPicBmp;
+            break;
+        }
+    }
+
+    bool parseImageCollectionMode(const std::string &text, ImageCollectionMode &mode)
+    {
+        const std::string normalized = toLowerAscii(text);
+        if (normalized == "sequential" || normalized == "pic" || normalized == "pic-seq")
+        {
+            mode = ImageCollectionMode::SequentialPicBmp;
+            return true;
+        }
+        if (normalized == "scan" || normalized == "scan-all" || normalized == "natural")
+        {
+            mode = ImageCollectionMode::ScanAllNatural;
+            return true;
+        }
+
+        return false;
+    }
+
+    std::string imageCollectionModeName(ImageCollectionMode mode)
+    {
+        switch (mode)
+        {
+        case ImageCollectionMode::SequentialPicBmp:
+            return "sequential-pic-bmp";
+        case ImageCollectionMode::ScanAllNatural:
+            return "scan-all-natural";
+        }
+
+        return "scan-all-natural";
+    }
+
+    bool isSupportedImageExtension(const std::filesystem::path &path)
+    {
+        const std::string ext = toLowerAscii(path.extension().u8string());
+        return ext == ".bmp" || ext == ".png" || ext == ".jpg" || ext == ".jpeg" ||
+               ext == ".tif" || ext == ".tiff";
+    }
+
+    bool naturalFilenameLess(const std::string &lhs, const std::string &rhs)
+    {
+        std::size_t i = 0;
+        std::size_t j = 0;
+        while (i < lhs.size() && j < rhs.size())
+        {
+            const unsigned char leftCh = static_cast<unsigned char>(lhs[i]);
+            const unsigned char rightCh = static_cast<unsigned char>(rhs[j]);
+            const bool leftDigit = std::isdigit(leftCh) != 0;
+            const bool rightDigit = std::isdigit(rightCh) != 0;
+
+            if (leftDigit && rightDigit)
+            {
+                std::size_t leftEnd = i;
+                while (leftEnd < lhs.size() && std::isdigit(static_cast<unsigned char>(lhs[leftEnd])) != 0)
+                {
+                    ++leftEnd;
+                }
+
+                std::size_t rightEnd = j;
+                while (rightEnd < rhs.size() && std::isdigit(static_cast<unsigned char>(rhs[rightEnd])) != 0)
+                {
+                    ++rightEnd;
+                }
+
+                const std::string leftDigits = lhs.substr(i, leftEnd - i);
+                const std::string rightDigits = rhs.substr(j, rightEnd - j);
+                std::size_t leftTrimmed = 0;
+                while (leftTrimmed + 1 < leftDigits.size() && leftDigits[leftTrimmed] == '0')
+                {
+                    ++leftTrimmed;
+                }
+                std::size_t rightTrimmed = 0;
+                while (rightTrimmed + 1 < rightDigits.size() && rightDigits[rightTrimmed] == '0')
+                {
+                    ++rightTrimmed;
+                }
+
+                const std::string leftNormalized = leftDigits.substr(leftTrimmed);
+                const std::string rightNormalized = rightDigits.substr(rightTrimmed);
+                if (leftNormalized.size() != rightNormalized.size())
+                {
+                    return leftNormalized.size() < rightNormalized.size();
+                }
+                if (leftNormalized != rightNormalized)
+                {
+                    return leftNormalized < rightNormalized;
+                }
+                if (leftDigits.size() != rightDigits.size())
+                {
+                    return leftDigits.size() < rightDigits.size();
+                }
+
+                i = leftEnd;
+                j = rightEnd;
+                continue;
+            }
+
+            const char leftLower = static_cast<char>(std::tolower(leftCh));
+            const char rightLower = static_cast<char>(std::tolower(rightCh));
+            if (leftLower != rightLower)
+            {
+                return leftLower < rightLower;
+            }
+
+            ++i;
+            ++j;
+        }
+
+        return lhs.size() < rhs.size();
+    }
+
     void printUsage(const char *argv0)
     {
         std::cout << "Usage:\n"
                   << "  " << argv0 << " <input_dir> <image_count> [--out <out_png>]\n"
                   << "               [--csv <out_csv>] [--debug-dir <process_dir>] [--no-process-vis]\n"
+                  << "               [--preset {gui|pinjie-cli|stitch-app}] [--input-mode {scan|sequential}]\n"
+                  << "               [--run-mode {full|registration}]\n"
+                  << "               [--endpoint-probe-fast]\n"
+                  << "               [--scan-all-images]\n"
                   << "               [--start-index <n>]\n"
                   << "               [--overlap <ratio_or_percent>] [--direction {auto|x+|x-|y+|y-}]\n"
                   << "               [--search-range <pixels>] [--base-search-range <pixels>]\n"
@@ -100,28 +353,116 @@ namespace
                   << "               [--no-point-filter] [--filter-confidence-q <ratio_or_percent>]\n"
                   << "               [--filter-gradient-q <ratio_or_percent>] [--filter-window-radius <points>]\n"
                   << "               [--filter-hampel-sigma <sigma>] [--filter-hampel-min-scale <px>]\n"
-                  << "               defaults: --overlap 0.875 --direction x+ --search-range 200\n"
-                  << "                         --rotation-range 1.0 --rotation-step 0.05\n"
+                  << "               defaults: --preset gui --input-mode scan --overlap 0.875\n"
+                  << "                         --direction x+ --search-range 200\n"
+                  << "                         --rotation-range 0.5 --rotation-step 0.01\n"
                   << "                         tangent weights: residual=0.05, correlation=0.25\n"
-                  << "                         point-filter on, q=0.15/0.15, radius=5, sigma=3.0\n\n"
+                  << "                         point-filter on, q=0.15/0.15, radius=5, sigma=3.0\n"
+                  << "               presets:\n"
+                  << "                         gui         => search-range 200, rotation +/-0.5 deg, step 0.01,\n"
+                  << "                                        scan all supported images using natural sort\n"
+                  << "                         pinjie-cli  => historical pinjie_cli defaults (200, +/-1.0, step 0.05)\n"
+                  << "                         stitch-app  => legacy stitch_app defaults (3000, +/-1.0, step 0.05)\n\n"
                   << "Example:\n"
                   << "  " << argv0 << " D:/VSCode_Project/pinjie/<input_dir> 2\n";
     }
 
-    std::vector<std::string> collectSequentialImagePaths(const std::filesystem::path &inputDir,
-                                                         int imageCount,
-                                                         int startIndex)
+    bool collectImagePaths(const std::filesystem::path &inputDir,
+                           int imageCount,
+                           int startIndex,
+                           ImageCollectionMode imageCollectionMode,
+                           std::vector<std::string> &paths,
+                           std::string &errorMessage)
     {
-        std::vector<std::string> paths;
+        paths.clear();
         paths.reserve(static_cast<std::size_t>(std::max(imageCount, 0)));
+
+        if (imageCollectionMode == ImageCollectionMode::SequentialPicBmp)
+        {
+            for (int i = 0; i < imageCount; ++i)
+            {
+                const std::filesystem::path imagePath = inputDir / ("Pic_" + std::to_string(startIndex + i) + ".bmp");
+                if (!std::filesystem::exists(imagePath))
+                {
+                    errorMessage = "Missing sequential image: " + imagePath.generic_string();
+                    paths.clear();
+                    return false;
+                }
+                paths.push_back(imagePath.u8string());
+            }
+            return true;
+        }
+
+        std::vector<std::filesystem::path> scannedImages;
+        std::error_code iterError;
+        for (const std::filesystem::directory_entry &entry : std::filesystem::directory_iterator(inputDir, iterError))
+        {
+            if (iterError)
+            {
+                errorMessage = "Failed to scan input directory: " + inputDir.generic_string();
+                paths.clear();
+                return false;
+            }
+            if (!entry.is_regular_file())
+            {
+                continue;
+            }
+            if (!isSupportedImageExtension(entry.path()))
+            {
+                continue;
+            }
+            scannedImages.push_back(entry.path());
+        }
+
+        std::sort(scannedImages.begin(), scannedImages.end(),
+                  [](const std::filesystem::path &lhs, const std::filesystem::path &rhs)
+                  {
+                      return naturalFilenameLess(lhs.filename().u8string(), rhs.filename().u8string());
+                  });
+
+        const int zeroBasedStart = std::max(0, startIndex - 1);
+        if (zeroBasedStart >= static_cast<int>(scannedImages.size()))
+        {
+            errorMessage = "start-index exceeds scanned image count.";
+            paths.clear();
+            return false;
+        }
+
+        if (zeroBasedStart + imageCount > static_cast<int>(scannedImages.size()))
+        {
+            errorMessage = "Requested image_count exceeds scanned image count.";
+            paths.clear();
+            return false;
+        }
 
         for (int i = 0; i < imageCount; ++i)
         {
-            const std::filesystem::path imagePath = inputDir / ("Pic_" + std::to_string(startIndex + i) + ".bmp");
-            paths.push_back(imagePath.u8string());
+            paths.push_back(scannedImages[static_cast<std::size_t>(zeroBasedStart + i)].u8string());
         }
 
-        return paths;
+        return true;
+    }
+
+    void printResolvedConfiguration(CliPreset preset,
+                                    CliRunMode runMode,
+                                    ImageCollectionMode imageCollectionMode,
+                                    int startIndex,
+                                    int imageCount,
+                                    double overlapRatio,
+                                    double baseSearchRange,
+                                    double rotationMinDeg,
+                                    double rotationMaxDeg,
+                                    double rotationStepDeg)
+    {
+        std::cout << "[Config] preset=" << cliPresetName(preset)
+                  << ", run-mode=" << cliRunModeName(runMode)
+                  << ", input-mode=" << imageCollectionModeName(imageCollectionMode)
+                  << ", start-index=" << startIndex
+                  << ", image-count=" << imageCount << '\n';
+        std::cout << "[Config] overlap=" << overlapRatio
+                  << ", search-range=" << baseSearchRange
+                  << ", rotation=[" << rotationMinDeg << ", " << rotationMaxDeg
+                  << "], step=" << rotationStepDeg << std::endl;
     }
 
 } // namespace
@@ -171,9 +512,9 @@ int main(int argc, char **argv)
     int startIndex = 1;
     double overlapRatio = 0.875;
     double baseSearchRange = 200.0;
-    double rotationMinDeg = -1.0;
-    double rotationMaxDeg = 1.0;
-    double rotationStepDeg = 0.05;
+    double rotationMinDeg = -0.5;
+    double rotationMaxDeg = 0.5;
+    double rotationStepDeg = 0.01;
     double tangentResidualWeight = 0.05;
     double tangentCorrelationWeight = 0.25;
     bool enablePointFiltering = true;
@@ -183,6 +524,26 @@ int main(int argc, char **argv)
     double filterHampelSigma = 3.0;
     double filterHampelMinScale = 0.05;
     pinjie::MotionPriorDirection directionConstraint = pinjie::MotionPriorDirection::XPositive;
+    CliPreset preset = CliPreset::Gui;
+    CliRunMode runMode = CliRunMode::Full;
+    bool endpointProbeFastMode = false;
+    ImageCollectionMode imageCollectionMode = ImageCollectionMode::ScanAllNatural;
+    applyCliPreset(preset,
+                   overlapRatio,
+                   baseSearchRange,
+                   rotationMinDeg,
+                   rotationMaxDeg,
+                   rotationStepDeg,
+                   tangentResidualWeight,
+                   tangentCorrelationWeight,
+                   enablePointFiltering,
+                   filterConfidenceQuantile,
+                   filterGradientQuantile,
+                   filterWindowRadius,
+                   filterHampelSigma,
+                   filterHampelMinScale,
+                   directionConstraint,
+                   imageCollectionMode);
     for (int i = 3; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -201,6 +562,57 @@ int main(int argc, char **argv)
         else if (arg == "--no-process-vis")
         {
             saveDebugVisualization = false;
+        }
+        else if (arg == "--preset" && i + 1 < argc)
+        {
+            CliPreset parsedPreset = CliPreset::Gui;
+            if (!parseCliPreset(argv[++i], parsedPreset))
+            {
+                std::cout << "[Error] Invalid preset. Use gui, pinjie-cli, or stitch-app.\n";
+                return -1;
+            }
+
+            preset = parsedPreset;
+            applyCliPreset(preset,
+                           overlapRatio,
+                           baseSearchRange,
+                           rotationMinDeg,
+                           rotationMaxDeg,
+                           rotationStepDeg,
+                           tangentResidualWeight,
+                           tangentCorrelationWeight,
+                           enablePointFiltering,
+                           filterConfidenceQuantile,
+                           filterGradientQuantile,
+                           filterWindowRadius,
+                           filterHampelSigma,
+                           filterHampelMinScale,
+                           directionConstraint,
+                           imageCollectionMode);
+        }
+        else if (arg == "--run-mode" && i + 1 < argc)
+        {
+            if (!parseCliRunMode(argv[++i], runMode))
+            {
+                std::cout << "[Error] Invalid run-mode. Use full or registration.\n";
+                return -1;
+            }
+        }
+        else if (arg == "--endpoint-probe-fast")
+        {
+            endpointProbeFastMode = true;
+        }
+        else if (arg == "--input-mode" && i + 1 < argc)
+        {
+            if (!parseImageCollectionMode(argv[++i], imageCollectionMode))
+            {
+                std::cout << "[Error] Invalid input-mode. Use scan or sequential.\n";
+                return -1;
+            }
+        }
+        else if (arg == "--scan-all-images")
+        {
+            imageCollectionMode = ImageCollectionMode::ScanAllNatural;
         }
         else if (arg == "--overlap" && i + 1 < argc)
         {
@@ -395,6 +807,17 @@ int main(int argc, char **argv)
         }
     }
 
+    printResolvedConfiguration(preset,
+                               runMode,
+                               imageCollectionMode,
+                               startIndex,
+                               imageCount,
+                               overlapRatio,
+                               baseSearchRange,
+                               rotationMinDeg,
+                               rotationMaxDeg,
+                               rotationStepDeg);
+
     panoramaPath = pinjie::resolveResultPathUnderBase(panoramaPath, defaultResultPaths.runDir);
     const std::filesystem::path outputDir =
         panoramaPath.parent_path().empty() ? defaultResultPaths.runDir : panoramaPath.parent_path();
@@ -433,7 +856,17 @@ int main(int argc, char **argv)
     }
 
     pinjie::StitchRunRequest request;
-    request.imagePaths = collectSequentialImagePaths(inputPath, imageCount, startIndex);
+    std::string imageCollectionError;
+    if (!collectImagePaths(inputPath,
+                           imageCount,
+                           startIndex,
+                           imageCollectionMode,
+                           request.imagePaths,
+                           imageCollectionError))
+    {
+        std::cout << "[Error] " << imageCollectionError << std::endl;
+        return -1;
+    }
     request.edgeConfig.cannyLow = 50.0;
     request.edgeConfig.cannyHigh = 150.0;
     request.edgeConfig.subpixWindow = 7;
@@ -454,23 +887,29 @@ int main(int argc, char **argv)
     request.pipelineConfig.tangentResidualCostWeight = tangentResidualWeight;
     request.pipelineConfig.tangentCorrelationCostWeight = tangentCorrelationWeight;
     request.pipelineConfig.generateDebugVisualization = saveDebugVisualization;
+    request.pipelineConfig.enableDesignComparison = runMode != CliRunMode::Registration;
+    request.pipelineConfig.endpointProbeFastMode = endpointProbeFastMode;
     request.resultOutputDir = pinjie::genericUtf8String(outputDir);
     request.panoramaOutputPath = panoramaPath.u8string();
     request.csvOutputPath = csvPath.u8string();
-    request.designErrorProfileCsvOutputPath =
-        pinjie::genericUtf8String(outputDir / "design_error_profile.csv");
-    request.designErrorSummaryCsvOutputPath =
-        pinjie::genericUtf8String(outputDir / "design_error_summary.csv");
-    request.designComparisonOverlayOutputPath =
-        pinjie::genericUtf8String(outputDir / "design_comparison_overlay.png");
-    request.qualityReviewCsvOutputPath =
-        pinjie::genericUtf8String(outputDir / "quality_review.csv");
     request.alignmentCandidateDiagnosticsCsvOutputPath =
         pinjie::genericUtf8String(outputDir / "alignment_candidate_diagnostics.csv");
-    request.contourOverlayOutputPath = pinjie::genericUtf8String(outputDir / "origin_contour_overlay.png");
-    request.tangentCorrelationAllOutputPath = pinjie::genericUtf8String(outputDir / "tangent_correlation_all.png");
-    request.tangentCorrelationInlierOutputPath =
-        pinjie::genericUtf8String(outputDir / "tangent_correlation_inlier.png");
+    if (runMode == CliRunMode::Full)
+    {
+        request.designErrorProfileCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "design_error_profile.csv");
+        request.designErrorSummaryCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "design_error_summary.csv");
+        request.designComparisonOverlayOutputPath =
+            pinjie::genericUtf8String(outputDir / "design_comparison_overlay.png");
+        request.qualityReviewCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "quality_review.csv");
+        request.contourOverlayOutputPath = pinjie::genericUtf8String(outputDir / "origin_contour_overlay.png");
+        request.tangentCorrelationAllOutputPath =
+            pinjie::genericUtf8String(outputDir / "tangent_correlation_all.png");
+        request.tangentCorrelationInlierOutputPath =
+            pinjie::genericUtf8String(outputDir / "tangent_correlation_inlier.png");
+    }
     if (saveDebugVisualization)
     {
         request.debugImageOutputDir = pinjie::genericUtf8String(debugDir);
@@ -483,7 +922,10 @@ int main(int argc, char **argv)
     };
 
     const pinjie::StitchWorkflowService workflow;
-    pinjie::StitchRunResult result = workflow.run(request, pinjie::StitchRunMode::Full, callbacks);
+    const pinjie::StitchRunMode workflowRunMode =
+        runMode == CliRunMode::Registration ? pinjie::StitchRunMode::Registration
+                                            : pinjie::StitchRunMode::Full;
+    pinjie::StitchRunResult result = workflow.run(request, workflowRunMode, callbacks);
     if (!result.ok)
     {
         if (!result.message.empty())

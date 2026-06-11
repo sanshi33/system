@@ -34,3 +34,10 @@
 
 # Misc generated reports
 /*_quality_report.txt
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Analysis outputs
+/literature_fire_tube_compare/output/
