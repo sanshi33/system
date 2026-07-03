@@ -8,7 +8,7 @@ int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
     app.setStyle(QStringLiteral("Fusion"));
-    app.setApplicationName(QStringLiteral("磨削型面误差检测系统"));
+    app.setApplicationName(QStringLiteral("在线测量与误差补偿系统"));
     app.setOrganizationName(QStringLiteral("Pinjie"));
 
     QFont uiFont;

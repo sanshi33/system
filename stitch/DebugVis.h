@@ -27,7 +27,8 @@ cv::Mat buildDebugStepVisualization(const cv::Mat& imgRef,
 cv::Mat buildPreprocessVisualization(const cv::Mat& sourceImage,
                                      const std::vector<cv::Point2d>& filteredEdges,
                                      int imageIndex,
-                                     int totalImages);
+                                     int totalImages,
+                                     const std::string& preprocessingMode = {});
 
 cv::Mat buildStitchedContourOverlay(const cv::Mat& panorama,
                                     const std::vector<EdgeVariants>& edges,

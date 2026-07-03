@@ -711,7 +711,8 @@ void drawTextBox(cv::Mat& canvas,
 cv::Mat buildPreprocessVisualization(const cv::Mat& sourceImage,
                                      const std::vector<cv::Point2d>& filteredEdges,
                                      int imageIndex,
-                                     int totalImages)
+                                     int totalImages,
+                                     const std::string& preprocessingMode)
 {
     if (sourceImage.empty()) {
         return {};
@@ -758,6 +759,9 @@ cv::Mat buildPreprocessVisualization(const cv::Mat& sourceImage,
     info << "Image " << imageIndex << "/" << totalImages
          << " | edges " << filteredEdges.size()
          << " | " << sourceImage.cols << "x" << sourceImage.rows << " px";
+    if (!preprocessingMode.empty()) {
+        info << " | " << preprocessingMode;
+    }
     cv::putText(canvas,
                 info.str(),
                 cv::Point(outerPad, 48),
@@ -769,7 +773,13 @@ cv::Mat buildPreprocessVisualization(const cv::Mat& sourceImage,
 
     drawTextBox(canvas, "Raw field", cv::Point(leftRect.x + 8, leftRect.y + leftRect.height - 8), 0.56,
                 cv::Scalar(45, 45, 45));
-    drawTextBox(canvas, "Filtered edge overlay",
+    std::string overlayLabel = "Filtered edge overlay";
+    if (preprocessingMode == "Binary mask edge") {
+        overlayLabel = "Binary mask edge overlay";
+    } else if (preprocessingMode == "Binary line skeleton") {
+        overlayLabel = "Binary skeleton overlay";
+    }
+    drawTextBox(canvas, overlayLabel,
                 cv::Point(rightRect.x + 8, rightRect.y + rightRect.height - 8), 0.56, cv::Scalar(45, 45, 45));
 
     return cropWhiteMargin(canvas, 8);

@@ -34,6 +34,17 @@ namespace pinjie::gui {
 
 namespace {
 
+QString defaultWorkpieceImageDir()
+{
+#ifdef PINJIE_PROJECT_ROOT
+    const QString root = QString::fromUtf8(PINJIE_PROJECT_ROOT);
+#else
+    const QString root = QDir::currentPath();
+#endif
+    const QString caseDir = QDir(root).filePath(QStringLiteral("test_cases/online_slot_cases/images/test"));
+    return QDir(caseDir).exists() ? QDir::toNativeSeparators(caseDir) : QString();
+}
+
 QWidget* makeSectionPanel(const QString& objectName, QWidget* parent)
 {
     auto* panel = new QWidget(parent);
@@ -84,7 +95,7 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     auto* inputLayout = new QVBoxLayout(inputGroup);
 
     auto* dirRow = new QHBoxLayout();
-    inputDirEdit_ = new QLineEdit(inputGroup);
+    inputDirEdit_ = new QLineEdit(defaultWorkpieceImageDir(), inputGroup);
     inputDirEdit_->setPlaceholderText(QStringLiteral("选择图像目录"));
     inputDirEdit_->setToolTip(QStringLiteral("支持 bmp、png、jpg、jpeg、tif、tiff 格式"));
     auto* browseButton = new QPushButton(QStringLiteral("浏览"), inputGroup);
@@ -105,7 +116,7 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     inputForm->addRow(QStringLiteral("目录统计"), detectedCountLabel_);
     inputLayout->addLayout(inputForm);
     acquisitionLayout->addWidget(makeCollapsibleSection(QStringLiteral("基础参数"), inputGroup, true, acquisitionSection_));
-    auto* cameraGroup = new QGroupBox(QStringLiteral("相机采集"), acquisitionSection_);
+    auto* cameraGroup = new QGroupBox(QStringLiteral("图像导入与相机采集"), acquisitionSection_);
     auto* cameraLayout = new QVBoxLayout(cameraGroup);
 
     auto* cameraDeviceRow = new QHBoxLayout();
@@ -204,7 +215,7 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     cameraCancelButton_->setEnabled(false);
     cameraLayout->addWidget(cameraCancelButton_);
     cameraLayout->addWidget(cameraStatusLabel_);
-    cameraPreviewInfoLabel_ = new QLabel(QStringLiteral("最近一张图像预览会显示在下方。"), cameraGroup);
+    cameraPreviewInfoLabel_ = new QLabel(QStringLiteral("导入图像或相机采集预览会显示在下方。"), cameraGroup);
     cameraPreviewInfoLabel_->setWordWrap(true);
     cameraPreviewViewer_ = new ImageViewer(cameraGroup);
     cameraPreviewViewer_->setMinimumHeight(220);
@@ -212,11 +223,11 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     cameraLayout->addWidget(cameraPreviewViewer_);
 
 #ifndef PINJIE_ENABLE_GALAXY_CAMERA
-    cameraGroup->setEnabled(false);
-    cameraStatusLabel_->setText(QStringLiteral("当前构建未启用 Galaxy 相机 SDK。"));
+    setCameraControlsEnabled(false);
+    cameraStatusLabel_->setText(QStringLiteral("当前构建未启用 Galaxy 相机 SDK；仍可预览导入的工件图像。"));
 #endif
 
-    acquisitionLayout->addWidget(makeCollapsibleSection(QStringLiteral("相机采集"), cameraGroup, false, acquisitionSection_));
+    acquisitionLayout->addWidget(makeCollapsibleSection(QStringLiteral("图像导入与相机采集"), cameraGroup, true, acquisitionSection_));
     acquisitionLayout->addStretch(1);
 
     processingSection_ = makeSectionPanel(QStringLiteral("processingConfigSection"), this);
@@ -533,15 +544,22 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
     reportLayout->addStretch(1);
 
     connect(browseButton, &QPushButton::clicked, this, [this]() {
-        const QString dir =
-            QFileDialog::getExistingDirectory(this, QStringLiteral("选择图像目录"), inputDirEdit_->text());
-        if (!dir.isEmpty()) {
-            inputDirEdit_->setText(QDir::toNativeSeparators(dir));
+        const QString startDir =
+            inputDirEdit_->text().trimmed().isEmpty() ? defaultWorkpieceImageDir()
+                                                      : inputDirEdit_->text().trimmed();
+        const QString filePath = QFileDialog::getOpenFileName(
+            this,
+            QStringLiteral("选择工件图像"),
+            startDir,
+            QStringLiteral("Image Files (*.bmp *.png *.jpg *.jpeg *.tif *.tiff);;All Files (*.*)"));
+        if (!filePath.isEmpty()) {
+            inputDirEdit_->setText(QDir::toNativeSeparators(QFileInfo(filePath).absolutePath()));
         }
     });
 
     connect(inputDirEdit_, &QLineEdit::textChanged, this, [this]() {
         updateDetectedCount();
+        updateInputImagePreview();
         emit configChanged();
     });
 
@@ -584,6 +602,7 @@ RunConfigPanel::RunConfigPanel(QWidget* parent)
 
     connectChangeSignals();
     updateDetectedCount();
+    updateInputImagePreview();
     updateCameraStepControlsEnabled();
 }
 
@@ -758,8 +777,14 @@ bool RunConfigPanel::buildRequest(pinjie::StitchRunRequest& request,
         request.csvOutputPath = pinjie::genericUtf8String(resultPaths.csvPath);
         request.designErrorProfileCsvOutputPath = pinjie::genericUtf8String(resultPaths.designErrorProfileCsvPath);
         request.designErrorSummaryCsvOutputPath = pinjie::genericUtf8String(resultPaths.designErrorSummaryCsvPath);
+        request.design3dErrorCsvOutputPath = pinjie::genericUtf8String(resultPaths.design3dErrorCsvPath);
+        request.designCompensationCsvOutputPath = pinjie::genericUtf8String(resultPaths.designCompensationCsvPath);
+        request.designFeatureCompensationCsvOutputPath =
+            pinjie::genericUtf8String(resultPaths.designFeatureCompensationCsvPath);
         request.designComparisonOverlayOutputPath =
             pinjie::genericUtf8String(resultPaths.designComparisonOverlayPath);
+        request.designCompensationPlotOutputPath =
+            pinjie::genericUtf8String(resultPaths.designCompensationPlotPath);
         request.qualityReviewCsvOutputPath = pinjie::genericUtf8String(resultPaths.qualityReviewCsvPath);
         request.contourPointsCsvOutputPath = pinjie::genericUtf8String(resultPaths.contourPointsCsvPath);
         request.originContourOverlayCsvOutputPath = pinjie::genericUtf8String(resultPaths.originContourOverlayCsvPath);
@@ -774,12 +799,6 @@ bool RunConfigPanel::buildRequest(pinjie::StitchRunRequest& request,
             request.alignmentCandidateDiagnosticsCsvOutputPath =
                 pinjie::genericUtf8String(resultPaths.alignmentCandidateDiagnosticsCsvPath);
         }
-        request.contourOverlayOutputPath = pinjie::genericUtf8String(resultPaths.contourOverlayPath);
-        request.stitchedContourProfilePlotOutputPath =
-            pinjie::genericUtf8String(resultPaths.stitchedContourProfilePlotPath);
-        request.tangentCorrelationAllOutputPath = pinjie::genericUtf8String(resultPaths.tangentCorrelationAllPath);
-        request.tangentCorrelationInlierOutputPath =
-            pinjie::genericUtf8String(resultPaths.tangentCorrelationInlierPath);
         if (saveDebugCheck_->isChecked()) {
             request.debugImageOutputDir = pinjie::genericUtf8String(resultPaths.debugDir);
         }
@@ -929,6 +948,35 @@ void RunConfigPanel::updateDetectedCount()
 {
     const QStringList imagePaths = scanImagePaths();
     detectedCountLabel_->setText(QStringLiteral("已检测 %1 张图像").arg(imagePaths.size()));
+}
+
+void RunConfigPanel::updateInputImagePreview()
+{
+    const QStringList imagePaths = scanImagePaths();
+    if (imagePaths.isEmpty()) {
+        updateCameraPreview(QImage(), QStringLiteral("等待导入工件图像或相机采集预览。"));
+        return;
+    }
+
+    const QString firstImagePath = imagePaths.first();
+    const QImage image(firstImagePath);
+    const QFileInfo imageInfo(firstImagePath);
+    if (image.isNull()) {
+        updateCameraPreview(
+            QImage(),
+            QStringLiteral("已检测 %1 张工件图像，但首张图像读取失败：\n%2")
+                .arg(imagePaths.size())
+                .arg(QDir::toNativeSeparators(firstImagePath)));
+        return;
+    }
+
+    const QString summary =
+        QStringLiteral("工件图像导入预览\n来源：本地图像目录\n文件：%1\n图像尺寸：%2 x %3 px\n目录图像数：%4 张")
+            .arg(imageInfo.fileName())
+            .arg(image.width())
+            .arg(image.height())
+            .arg(imagePaths.size());
+    updateCameraPreview(image, summary);
 }
 
 bool RunConfigPanel::buildCameraRequest(pinjie::CameraSequenceRequest& request,
@@ -1110,7 +1158,7 @@ void RunConfigPanel::updateCameraPreview(const QImage& image, const QString& sum
         }
     }
     if (cameraPreviewInfoLabel_) {
-        cameraPreviewInfoLabel_->setText(summary.isEmpty() ? QStringLiteral("等待采集图像预览。") : summary);
+        cameraPreviewInfoLabel_->setText(summary.isEmpty() ? QStringLiteral("等待导入图像或相机采集预览。") : summary);
     }
     emit cameraPreviewUpdated(image, summary);
 }

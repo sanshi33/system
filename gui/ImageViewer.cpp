@@ -7,6 +7,7 @@
 #include <QWheelEvent>
 
 #include <algorithm>
+#include <cmath>
 
 namespace pinjie::gui {
 
@@ -51,6 +52,16 @@ void ImageViewer::clearImage()
     zoomFactor_ = 1.0;
     resetTransform();
     viewport()->update();
+}
+
+QSize ImageViewer::recommendedExportPixelSize() const
+{
+    const QSize viewportSize = viewport() ? viewport()->size() : size();
+    const double dpr = viewport() ? viewport()->devicePixelRatioF() : devicePixelRatioF();
+    const double factor = std::clamp(dpr * 1.15, 1.15, 1.90);
+    const int width = std::clamp(static_cast<int>(std::lround(viewportSize.width() * factor)), 960, 2400);
+    const int height = std::clamp(static_cast<int>(std::lround(viewportSize.height() * factor)), 620, 1680);
+    return QSize(width, height);
 }
 
 void ImageViewer::resizeEvent(QResizeEvent* event)

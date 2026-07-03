@@ -20,7 +20,11 @@ struct StitchResultPathSet {
     std::filesystem::path csvPath;
     std::filesystem::path designErrorProfileCsvPath;
     std::filesystem::path designErrorSummaryCsvPath;
+    std::filesystem::path design3dErrorCsvPath;
+    std::filesystem::path designCompensationCsvPath;
+    std::filesystem::path designFeatureCompensationCsvPath;
     std::filesystem::path designComparisonOverlayPath;
+    std::filesystem::path designCompensationPlotPath;
     std::filesystem::path qualityReviewCsvPath;
     std::filesystem::path alignmentCandidateDiagnosticsCsvPath;
     std::filesystem::path contourPointsCsvPath;
@@ -124,7 +128,11 @@ inline StitchResultPathSet buildDefaultStitchResultPaths(const std::string& runN
     paths.csvPath = paths.runDir / "stitching_data.csv";
     paths.designErrorProfileCsvPath = paths.runDir / "design_error_profile.csv";
     paths.designErrorSummaryCsvPath = paths.runDir / "design_error_summary.csv";
+    paths.design3dErrorCsvPath = paths.runDir / "design_3d_error_points.csv";
+    paths.designCompensationCsvPath = paths.runDir / "design_compensation.csv";
+    paths.designFeatureCompensationCsvPath = paths.runDir / "design_feature_compensation.csv";
     paths.designComparisonOverlayPath = paths.runDir / "design_comparison_overlay.png";
+    paths.designCompensationPlotPath = paths.runDir / "design_compensation_plot.png";
     paths.qualityReviewCsvPath = paths.runDir / "quality_review.csv";
     paths.alignmentCandidateDiagnosticsCsvPath = paths.runDir / "alignment_candidate_diagnostics.csv";
     paths.contourPointsCsvPath = paths.runDir / "contour_points.csv";

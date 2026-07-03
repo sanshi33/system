@@ -8,6 +8,7 @@
 #include "../core/SubpixelEdgeDetector.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -123,12 +124,21 @@ std::vector<EdgeVariants> preprocessAllImages(const std::vector<cv::Mat>& images
         emitProgress(callbacks, "preprocess", i + 1, images.size());
         emitLog(callbacks,
                 "[预处理] 图像 " + std::to_string(i + 1) + "/" + std::to_string(images.size()));
+        const auto preprocessBegin = std::chrono::steady_clock::now();
 
         EdgeVariants variants = buildEdgeVariants(detector, images[i], cfg);
+        const auto preprocessEnd = std::chrono::steady_clock::now();
+        const double preprocessSeconds =
+            std::chrono::duration<double>(preprocessEnd - preprocessBegin).count();
         if (variants.raw.size() < cfg.minWarnPoints) {
             emitLog(callbacks,
                     "    [警告] 边缘点数量过少：" + std::to_string(variants.raw.size()));
         }
+        emitLog(callbacks,
+                "    [Timing] preprocess image " + std::to_string(i + 1) +
+                    " runtime = " + std::to_string(preprocessSeconds) + " s");
+        emitLog(callbacks,
+                "    [PreprocessDetail] " + variants.preprocessingMode);
 
         edgesList.push_back(std::move(variants));
     }

@@ -1,9 +1,11 @@
 #include "Alignment.h"
 #include "GeometryUtils.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <utility>
 
 namespace stitch {
@@ -15,6 +17,7 @@ using std::vector;
 namespace {
 
 struct SampledPair {
+    double arcCoord{0.0};
     double primary{0.0};
     double normalErr{0.0};
     double tangentErr{0.0};
@@ -30,6 +33,12 @@ struct TangentMatchCost {
     {
         return residualCost + correlationCost;
     }
+};
+
+struct FineSearchCandidate {
+    TransformResult candidate;
+    double normalCost{1e9};
+    double quickScore{1e9};
 };
 
 double computeQuantile(vector<double> values, double q)
@@ -260,6 +269,245 @@ double computePearsonCorrelation(const vector<double>& a, const vector<double>& 
     return std::clamp(cov / std::sqrt(varA * varB), -1.0, 1.0);
 }
 
+std::size_t chooseSmoothingWindow(std::size_t count)
+{
+    if (count <= 3) {
+        return count;
+    }
+
+    std::size_t window = 11;
+    if (count > 120) {
+        window = 31;
+    } else if (count > 60) {
+        window = 21;
+    } else if (count > 20) {
+        window = 11;
+    } else {
+        window = 5;
+    }
+
+    if (window > count) {
+        window = count;
+    }
+    if (window % 2 == 0) {
+        window = window > 1 ? window - 1 : 1;
+    }
+
+    return std::max<std::size_t>(1, window);
+}
+
+vector<double> buildSmoothedSeries(const vector<double>& values)
+{
+    vector<double> smoothed(values.size(), 0.0);
+    if (values.empty()) {
+        return smoothed;
+    }
+
+    const std::size_t window = chooseSmoothingWindow(values.size());
+    const std::size_t halfWindow = window / 2;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const std::size_t begin = (i > halfWindow) ? (i - halfWindow) : 0;
+        const std::size_t end = std::min(values.size() - 1, i + halfWindow);
+
+        double sum = 0.0;
+        std::size_t count = 0;
+        for (std::size_t j = begin; j <= end; ++j) {
+            sum += values[j];
+            ++count;
+        }
+        smoothed[i] = count > 0 ? sum / static_cast<double>(count) : values[i];
+    }
+
+    return smoothed;
+}
+
+vector<double> buildFluctuationSeries(const vector<double>& values)
+{
+    const vector<double> smoothed = buildSmoothedSeries(values);
+    vector<double> fluctuation(values.size(), 0.0);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        fluctuation[i] = values[i] - smoothed[i];
+    }
+    return fluctuation;
+}
+
+double computeFastFluctuationCorrelation(const vector<double>& refSecondary,
+                                         const vector<double>& targetSecondary)
+{
+    if (refSecondary.size() != targetSecondary.size() || refSecondary.empty()) {
+        return 0.0;
+    }
+
+    const vector<double> refFluctuation = buildFluctuationSeries(refSecondary);
+    const vector<double> targetFluctuation = buildFluctuationSeries(targetSecondary);
+    return computePearsonCorrelation(refFluctuation, targetFluctuation);
+}
+
+double computeMedianStep(const vector<double>& values)
+{
+    if (values.size() < 2) {
+        return 1.0;
+    }
+
+    vector<double> diffs;
+    diffs.reserve(values.size() - 1);
+    for (std::size_t i = 1; i < values.size(); ++i) {
+        const double diff = values[i] - values[i - 1];
+        if (std::abs(diff) > 1e-6) {
+            diffs.push_back(std::abs(diff));
+        }
+    }
+
+    if (diffs.empty()) {
+        return 1.0;
+    }
+    return std::max(1e-6, computeQuantile(diffs, 0.5));
+}
+
+vector<double> buildUniformGrid(double start, double end, double step)
+{
+    vector<double> grid;
+    if (!(end > start)) {
+        return grid;
+    }
+
+    if (!(step > 0.0) || !std::isfinite(step)) {
+        step = end - start;
+    }
+
+    const std::size_t count =
+        std::max<std::size_t>(2, static_cast<std::size_t>(std::floor((end - start) / step)) + 1);
+    grid.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        grid[i] = start + static_cast<double>(i) * step;
+    }
+    grid.back() = end;
+    return grid;
+}
+
+bool interpolateSeriesAtQueries(const vector<double>& coords,
+                                const vector<double>& values,
+                                const vector<double>& queries,
+                                vector<double>& outValues)
+{
+    outValues.clear();
+    if (coords.size() != values.size() || coords.size() < 2 || queries.empty()) {
+        return false;
+    }
+
+    outValues.reserve(queries.size());
+    for (double query : queries) {
+        auto it = std::lower_bound(coords.begin(), coords.end(), query);
+        if (it == coords.begin()) {
+            outValues.push_back(values.front());
+            continue;
+        }
+        if (it == coords.end()) {
+            outValues.push_back(values.back());
+            continue;
+        }
+
+        const std::size_t hi = static_cast<std::size_t>(it - coords.begin());
+        const std::size_t lo = hi - 1;
+        const double span = coords[hi] - coords[lo];
+        if (std::abs(span) < 1e-12) {
+            outValues.push_back(values[lo]);
+            continue;
+        }
+
+        const double ratio = (query - coords[lo]) / span;
+        outValues.push_back(values[lo] + ratio * (values[hi] - values[lo]));
+    }
+
+    return outValues.size() == queries.size();
+}
+
+bool buildOrderedUniqueSeries(const vector<double>& unfoldCoords,
+                              const vector<double>& refSecondary,
+                              const vector<double>& targetSecondary,
+                              vector<double>& outCoords,
+                              vector<double>& outRef,
+                              vector<double>& outTarget)
+{
+    outCoords.clear();
+    outRef.clear();
+    outTarget.clear();
+    if (unfoldCoords.size() != refSecondary.size() || unfoldCoords.size() != targetSecondary.size()) {
+        return false;
+    }
+
+    vector<std::size_t> order(unfoldCoords.size(), 0);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(),
+              [&](std::size_t lhs, std::size_t rhs) { return unfoldCoords[lhs] < unfoldCoords[rhs]; });
+
+    vector<int> counts;
+    counts.reserve(order.size());
+    for (std::size_t index : order) {
+        const double coord = unfoldCoords[index];
+        const double ref = refSecondary[index];
+        const double target = targetSecondary[index];
+        if (!std::isfinite(coord) || !std::isfinite(ref) || !std::isfinite(target)) {
+            continue;
+        }
+
+        if (!outCoords.empty() && std::abs(coord - outCoords.back()) < 1e-6) {
+            const int count = counts.back();
+            outRef.back() = (outRef.back() * static_cast<double>(count) + ref) / static_cast<double>(count + 1);
+            outTarget.back() =
+                (outTarget.back() * static_cast<double>(count) + target) / static_cast<double>(count + 1);
+            counts.back() = count + 1;
+            continue;
+        }
+
+        outCoords.push_back(coord);
+        outRef.push_back(ref);
+        outTarget.push_back(target);
+        counts.push_back(1);
+    }
+
+    return outCoords.size() >= 2;
+}
+
+// 用重叠区沿弧长展开后的轮廓波动序列做整体相关性，
+// 避免整体趋势项掩盖切向滑移造成的局部轮廓错位。
+double computeUnfoldedTangentCorrelation(const vector<double>& unfoldCoords,
+                                         const vector<double>& refSecondary,
+                                         const vector<double>& targetSecondary)
+{
+    vector<double> orderedCoords;
+    vector<double> orderedRef;
+    vector<double> orderedTarget;
+    if (!buildOrderedUniqueSeries(unfoldCoords, refSecondary, targetSecondary,
+                                  orderedCoords, orderedRef, orderedTarget)) {
+        return 0.0;
+    }
+
+    const double start = orderedCoords.front();
+    const double end = orderedCoords.back();
+    if (!(end > start)) {
+        return computePearsonCorrelation(orderedRef, orderedTarget);
+    }
+
+    double step = computeMedianStep(orderedCoords);
+    step = std::max(0.5, std::min(step, 1.0));
+    const vector<double> grid = buildUniformGrid(start, end, step);
+    if (grid.size() < 2) {
+        return computePearsonCorrelation(orderedRef, orderedTarget);
+    }
+
+    vector<double> refResampled;
+    vector<double> targetResampled;
+    if (!interpolateSeriesAtQueries(orderedCoords, orderedRef, grid, refResampled) ||
+        !interpolateSeriesAtQueries(orderedCoords, orderedTarget, grid, targetResampled)) {
+        return 0.0;
+    }
+
+    const vector<double> refFluctuation = buildFluctuationSeries(refResampled);
+    const vector<double> targetFluctuation = buildFluctuationSeries(targetResampled);
+    return computePearsonCorrelation(refFluctuation, targetFluctuation);
+}
+
 bool collectAlignmentSamples(const vector<Point2d>& refEdges,
                              const vector<Point2d>& rotatedTargetEdges,
                              const TransformResult& res,
@@ -270,6 +518,10 @@ bool collectAlignmentSamples(const vector<Point2d>& refEdges,
         return false;
 
     const Point2d translation(res.dx, res.dy);
+    vector<double> refArcCoords(refEdges.size(), 0.0);
+    for (std::size_t i = 1; i < refEdges.size(); ++i) {
+        refArcCoords[i] = refArcCoords[i - 1] + cv::norm(refEdges[i] - refEdges[i - 1]);
+    }
 
     for (const auto& rawPt : rotatedTargetEdges)
     {
@@ -313,6 +565,9 @@ bool collectAlignmentSamples(const vector<Point2d>& refEdges,
             const Point2d delta = pt - refPt;
 
             SampledPair sample;
+            sample.arcCoord =
+                refArcCoords[static_cast<std::size_t>((it - refEdges.begin()) - 1)] +
+                ratio * cv::norm(*it - *(it - 1));
             sample.primary = pt.x;
             sample.normalErr = delta.dot(normalUnit);
             sample.tangentErr = delta.dot(tangentUnit);
@@ -358,6 +613,9 @@ bool collectAlignmentSamples(const vector<Point2d>& refEdges,
             const Point2d delta = pt - refPt;
 
             SampledPair sample;
+            sample.arcCoord =
+                refArcCoords[static_cast<std::size_t>((it - refEdges.begin()) - 1)] +
+                ratio * cv::norm(*it - *(it - 1));
             sample.primary = pt.y;
             sample.normalErr = delta.dot(normalUnit);
             sample.tangentErr = delta.dot(tangentUnit);
@@ -374,7 +632,8 @@ TangentMatchCost computeTangentMatchCost(const vector<Point2d>& refEdges,
                                          const vector<Point2d>& rotatedTargetEdges,
                                          const TransformResult& candidate,
                                          double tangentResidualCostWeight,
-                                         double tangentCorrelationCostWeight)
+                                         double tangentCorrelationCostWeight,
+                                         bool useUnfoldedCorrelation)
 {
     TangentMatchCost cost;
     tangentResidualCostWeight = std::max(0.0, tangentResidualCostWeight);
@@ -426,9 +685,11 @@ TangentMatchCost computeTangentMatchCost(const vector<Point2d>& refEdges,
     }
 
     vector<double> tangentErrs;
+    vector<double> tangentArcCoords;
     vector<double> refSecondary;
     vector<double> targetSecondary;
     tangentErrs.reserve(samples.size());
+    tangentArcCoords.reserve(samples.size());
     refSecondary.reserve(samples.size());
     targetSecondary.reserve(samples.size());
 
@@ -439,6 +700,7 @@ TangentMatchCost computeTangentMatchCost(const vector<Point2d>& refEdges,
         if (std::abs(normalErrs[i] - center) > threshold)
             continue;
         tangentErrs.push_back(samples[i].tangentErr);
+        tangentArcCoords.push_back(samples[i].arcCoord);
         refSecondary.push_back(samples[i].refSecondary);
         targetSecondary.push_back(samples[i].targetSecondary);
     }
@@ -450,7 +712,10 @@ TangentMatchCost computeTangentMatchCost(const vector<Point2d>& refEdges,
     }
 
     const ResidualStatistics tangentStats = computeResidualStatistics(tangentErrs);
-    const double tangentCorr = computePearsonCorrelation(refSecondary, targetSecondary);
+    const double tangentCorr =
+        useUnfoldedCorrelation
+            ? computeUnfoldedTangentCorrelation(tangentArcCoords, refSecondary, targetSecondary)
+            : computeFastFluctuationCorrelation(refSecondary, targetSecondary);
 
     cost.residualCost = tangentResidualCostWeight * tangentStats.rmse * tangentStats.rmse;
     cost.correlationCost = tangentCorrelationCostWeight * std::max(0.0, 1.0 - tangentCorr);
@@ -625,11 +890,13 @@ double computeRobustCost(const vector<Point2d>& edges1,
 
 void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
                               const vector<Point2d>& rotated_target_edges,
-                              TransformResult& res)
+                              TransformResult& res,
+                              bool use_unfolded_tangent_correlation)
 {
     res.metrics = {};
     res.inlierErrors.clear();
     res.inlierCoordinates.clear();
+    res.sampleArcCoordinates.clear();
     res.samplePrimaryCoordinates.clear();
     res.sampleRefSecondaryCoordinates.clear();
     res.sampleTargetSecondaryCoordinates.clear();
@@ -645,17 +912,20 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
         return;
 
     vector<double> allPrimary;
+    vector<double> allArc;
     vector<double> allNormalErrs;
     vector<double> allTangentErrs;
     vector<double> allRefSecondary;
     vector<double> allTargetSecondary;
     allPrimary.reserve(samples.size());
+    allArc.reserve(samples.size());
     allNormalErrs.reserve(samples.size());
     allTangentErrs.reserve(samples.size());
     allRefSecondary.reserve(samples.size());
     allTargetSecondary.reserve(samples.size());
 
     for (const auto& sample : samples) {
+        allArc.push_back(sample.arcCoord);
         allPrimary.push_back(sample.primary);
         allNormalErrs.push_back(sample.normalErr);
         allTangentErrs.push_back(sample.tangentErr);
@@ -663,6 +933,7 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
         allTargetSecondary.push_back(sample.targetSecondary);
     }
 
+    res.sampleArcCoordinates = allArc;
     res.samplePrimaryCoordinates = allPrimary;
     res.sampleRefSecondaryCoordinates = allRefSecondary;
     res.sampleTargetSecondaryCoordinates = allTargetSecondary;
@@ -674,19 +945,31 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
     res.metrics.overlapCount = static_cast<int>(samples.size());
     res.metrics.overlapSpan = computePrimarySpan(allPrimary);
     res.metrics.overlapCoverageRatio = computeCoverageRatio(res.metrics.overlapSpan, referenceSpan);
+    const auto computeCorrelationMetric =
+        [&](const vector<double>& arc,
+            const vector<double>& refSecondary,
+            const vector<double>& targetSecondary) {
+            return use_unfolded_tangent_correlation
+                       ? computeUnfoldedTangentCorrelation(arc, refSecondary, targetSecondary)
+                       : computeFastFluctuationCorrelation(refSecondary, targetSecondary);
+        };
+
     res.metrics.normalAll = computeResidualStatistics(allNormalErrs);
     res.metrics.tangentAll = computeResidualStatistics(allTangentErrs);
-    res.metrics.tangentCorrAll = computePearsonCorrelation(allRefSecondary, allTargetSecondary);
+    res.metrics.tangentCorrAll =
+        computeCorrelationMetric(allArc, allRefSecondary, allTargetSecondary);
 
     const vector<unsigned char> coreMask = computeOverlapCoreMask(allPrimary);
     vector<double> coreNormalErrs;
     vector<double> coreTangentErrs;
     vector<double> corePrimary;
+    vector<double> coreArc;
     vector<double> coreRefSecondary;
     vector<double> coreTargetSecondary;
     coreNormalErrs.reserve(samples.size());
     coreTangentErrs.reserve(samples.size());
     corePrimary.reserve(samples.size());
+    coreArc.reserve(samples.size());
     coreRefSecondary.reserve(samples.size());
     coreTargetSecondary.reserve(samples.size());
     for (size_t i = 0; i < samples.size(); ++i) {
@@ -696,6 +979,7 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
         coreNormalErrs.push_back(allNormalErrs[i]);
         coreTangentErrs.push_back(allTangentErrs[i]);
         corePrimary.push_back(allPrimary[i]);
+        coreArc.push_back(allArc[i]);
         coreRefSecondary.push_back(allRefSecondary[i]);
         coreTargetSecondary.push_back(allTargetSecondary[i]);
     }
@@ -703,11 +987,13 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
     vector<double> trimmedNormalErrs;
     vector<double> trimmedTangentErrs;
     vector<double> trimmedPrimary;
+    vector<double> trimmedArc;
     vector<double> trimmedRefSecondary;
     vector<double> trimmedTargetSecondary;
     trimmedNormalErrs.reserve(coreNormalErrs.size());
     trimmedTangentErrs.reserve(coreTangentErrs.size());
     trimmedPrimary.reserve(corePrimary.size());
+    trimmedArc.reserve(coreArc.size());
     trimmedRefSecondary.reserve(coreRefSecondary.size());
     trimmedTargetSecondary.reserve(coreTargetSecondary.size());
 
@@ -731,6 +1017,7 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
         trimmedNormalErrs.push_back(coreNormalErrs[i]);
         trimmedTangentErrs.push_back(coreTangentErrs[i]);
         trimmedPrimary.push_back(corePrimary[i]);
+        trimmedArc.push_back(coreArc[i]);
         trimmedRefSecondary.push_back(coreRefSecondary[i]);
         trimmedTargetSecondary.push_back(coreTargetSecondary[i]);
     }
@@ -742,7 +1029,8 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
     res.metrics.trimmedOverlapCoverageRatio = computeCoverageRatio(res.metrics.trimmedOverlapSpan, referenceSpan);
     res.metrics.normalTrimmed = computeResidualStatistics(trimmedNormalErrs);
     res.metrics.tangentTrimmed = computeResidualStatistics(trimmedTangentErrs);
-    res.metrics.tangentCorrTrimmed = computePearsonCorrelation(trimmedRefSecondary, trimmedTargetSecondary);
+    res.metrics.tangentCorrTrimmed =
+        computeCorrelationMetric(trimmedArc, trimmedRefSecondary, trimmedTargetSecondary);
 
     if (samples.size() < 3) {
         res.inlierErrors = allNormalErrs;
@@ -773,11 +1061,13 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
     vector<double> inlierNormalErrs;
     vector<double> inlierTangentErrs;
     vector<double> inlierPrimary;
+    vector<double> inlierArc;
     vector<double> inlierRefSecondary;
     vector<double> inlierTargetSecondary;
     inlierNormalErrs.reserve(samples.size());
     inlierTangentErrs.reserve(samples.size());
     inlierPrimary.reserve(samples.size());
+    inlierArc.reserve(samples.size());
     inlierRefSecondary.reserve(samples.size());
     inlierTargetSecondary.reserve(samples.size());
 
@@ -790,6 +1080,7 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
         inlierNormalErrs.push_back(allNormalErrs[i]);
         inlierTangentErrs.push_back(allTangentErrs[i]);
         inlierPrimary.push_back(samples[i].primary);
+        inlierArc.push_back(samples[i].arcCoord);
         inlierRefSecondary.push_back(samples[i].refSecondary);
         inlierTargetSecondary.push_back(samples[i].targetSecondary);
     }
@@ -806,7 +1097,8 @@ void populateAlignmentMetrics(const vector<Point2d>& ref_edges,
     res.inlierCoordinates = inlierPrimary;
     res.metrics.normalInlier = computeResidualStatistics(inlierNormalErrs);
     res.metrics.tangentInlier = computeResidualStatistics(inlierTangentErrs);
-    res.metrics.tangentCorrInlier = computePearsonCorrelation(inlierRefSecondary, inlierTargetSecondary);
+    res.metrics.tangentCorrInlier =
+        computeCorrelationMetric(inlierArc, inlierRefSecondary, inlierTargetSecondary);
 }
 
 TransformResult computeGlobalAlignment(const vector<Point2d>& edges1,
@@ -819,20 +1111,25 @@ TransformResult computeGlobalAlignment(const vector<Point2d>& edges1,
                                        double tangent_correlation_cost_weight)
 {
     TransformResult res;
+    int coarseEvaluations = 0;
+    int coarseAccepted = 0;
+    int fineEvaluations = 0;
+    int fineAccepted = 0;
 
     const double rangeMin = expected_shift - search_range;
     const double rangeMax = expected_shift + search_range;
     const double coarseStep = 4.0;
+    const auto coarseBegin = std::chrono::steady_clock::now();
 
     for (double x = rangeMin; x <= rangeMax; x += coarseStep)
     {
+        ++coarseEvaluations;
         double meanPerp = 0.0;
-        vector<double> tmpErrs;
-        vector<double> tmpCoords;
-        const double normalCost = computeRobustCost(edges1, edges2, x, meanPerp, &tmpErrs, &tmpCoords, axis);
+        const double normalCost = computeRobustCost(edges1, edges2, x, meanPerp, nullptr, nullptr, axis);
 
         if (std::abs(meanPerp) > max_perp_threshold)
             continue;
+        ++coarseAccepted;
 
         TransformResult candidate;
         if (axis == TransformResult::AlignAxis::X)
@@ -850,39 +1147,74 @@ TransformResult computeGlobalAlignment(const vector<Point2d>& edges1,
         const TangentMatchCost tangentCost =
             computeTangentMatchCost(edges1, edges2, candidate,
                                     tangent_residual_cost_weight,
-                                    tangent_correlation_cost_weight);
+                                    tangent_correlation_cost_weight,
+                                    false);
         const double cost = normalCost + tangentCost.total();
 
         if (cost < res.score)
         {
-            res.score = cost;
-            res.normalMatchCost = normalCost;
-            res.tangentResidualMatchCost = tangentCost.residualCost;
-            res.tangentCorrelationMatchCost = tangentCost.correlationCost;
-            res.dx = candidate.dx;
-            res.dy = candidate.dy;
-            res.axis = axis;
-            res.inlierErrors = std::move(tmpErrs);
-            res.inlierCoordinates = std::move(tmpCoords);
+            double confirmedMeanPerp = 0.0;
+            vector<double> tmpErrs;
+            vector<double> tmpCoords;
+            const double confirmedNormalCost =
+                computeRobustCost(edges1, edges2, x, confirmedMeanPerp, &tmpErrs, &tmpCoords, axis);
+            if (std::abs(confirmedMeanPerp) > max_perp_threshold) {
+                continue;
+            }
+
+            if (axis == TransformResult::AlignAxis::X)
+            {
+                candidate.dy = confirmedMeanPerp;
+            }
+            else
+            {
+                candidate.dx = confirmedMeanPerp;
+            }
+
+            const TangentMatchCost confirmedTangentCost =
+                computeTangentMatchCost(edges1, edges2, candidate,
+                                        tangent_residual_cost_weight,
+                                        tangent_correlation_cost_weight,
+                                        false);
+            const double confirmedCost = confirmedNormalCost + confirmedTangentCost.total();
+            if (confirmedCost < res.score) {
+                res.score = confirmedCost;
+                res.normalMatchCost = confirmedNormalCost;
+                res.tangentResidualMatchCost = confirmedTangentCost.residualCost;
+                res.tangentCorrelationMatchCost = confirmedTangentCost.correlationCost;
+                res.dx = candidate.dx;
+                res.dy = candidate.dy;
+                res.axis = axis;
+                res.inlierErrors = std::move(tmpErrs);
+                res.inlierCoordinates = std::move(tmpCoords);
+            }
         }
     }
+    const auto coarseEnd = std::chrono::steady_clock::now();
 
+    auto fineBegin = coarseEnd;
+    auto fineEnd = coarseEnd;
+    auto refineBegin = coarseEnd;
+    auto refineEnd = coarseEnd;
     if (res.score < 1e8)
     {
+        fineBegin = std::chrono::steady_clock::now();
         const double fineRange = 4.0;
         const double fineStep = 0.1;
         const double startFine = (axis == TransformResult::AlignAxis::X ? res.dx : res.dy) - fineRange;
         const double endFine = (axis == TransformResult::AlignAxis::X ? res.dx : res.dy) + fineRange;
+        vector<FineSearchCandidate> fineCandidates;
+        fineCandidates.reserve(static_cast<size_t>(std::max(1.0, std::floor((endFine - startFine) / fineStep) + 1.0)));
 
         for (double x = startFine; x <= endFine; x += fineStep)
         {
+            ++fineEvaluations;
             double meanPerp = 0.0;
-            vector<double> tmpErrs;
-            vector<double> tmpCoords;
-            const double normalCost = computeRobustCost(edges1, edges2, x, meanPerp, &tmpErrs, &tmpCoords, axis);
+            const double normalCost = computeRobustCost(edges1, edges2, x, meanPerp, nullptr, nullptr, axis);
 
             if (std::abs(meanPerp) > max_perp_threshold)
                 continue;
+            ++fineAccepted;
 
             TransformResult candidate;
             if (axis == TransformResult::AlignAxis::X)
@@ -900,27 +1232,91 @@ TransformResult computeGlobalAlignment(const vector<Point2d>& edges1,
             const TangentMatchCost tangentCost =
                 computeTangentMatchCost(edges1, edges2, candidate,
                                         tangent_residual_cost_weight,
-                                        tangent_correlation_cost_weight);
-            const double cost = normalCost + tangentCost.total();
+                                        tangent_correlation_cost_weight,
+                                        false);
+            FineSearchCandidate summary;
+            summary.candidate = candidate;
+            summary.normalCost = normalCost;
+            summary.quickScore = normalCost + tangentCost.total();
+            fineCandidates.push_back(std::move(summary));
+        }
 
-            if (cost < res.score)
-            {
-                res.score = cost;
-                res.normalMatchCost = normalCost;
-                res.tangentResidualMatchCost = tangentCost.residualCost;
-                res.tangentCorrelationMatchCost = tangentCost.correlationCost;
-                res.dx = candidate.dx;
-                res.dy = candidate.dy;
-                res.axis = axis;
-                res.inlierErrors = std::move(tmpErrs);
-                res.inlierCoordinates = std::move(tmpCoords);
+        if (!fineCandidates.empty()) {
+            constexpr size_t kMaxPreciseCandidates = 8;
+            const size_t preciseCount = std::min(kMaxPreciseCandidates, fineCandidates.size());
+            std::nth_element(fineCandidates.begin(),
+                             fineCandidates.begin() + static_cast<std::ptrdiff_t>(preciseCount - 1),
+                             fineCandidates.end(),
+                             [](const FineSearchCandidate& lhs, const FineSearchCandidate& rhs) {
+                                 if (lhs.quickScore == rhs.quickScore) {
+                                     return lhs.normalCost < rhs.normalCost;
+                                 }
+                                 return lhs.quickScore < rhs.quickScore;
+                             });
+            fineCandidates.resize(preciseCount);
+            std::sort(fineCandidates.begin(), fineCandidates.end(),
+                      [](const FineSearchCandidate& lhs, const FineSearchCandidate& rhs) {
+                          if (lhs.quickScore == rhs.quickScore) {
+                              return lhs.normalCost < rhs.normalCost;
+                          }
+                          return lhs.quickScore < rhs.quickScore;
+                      });
+
+            TransformResult bestFinePrecise;
+            bestFinePrecise.score = 1e9;
+
+            for (const FineSearchCandidate& summary : fineCandidates) {
+                const double xCandidate =
+                    axis == TransformResult::AlignAxis::X ? summary.candidate.dx : summary.candidate.dy;
+                double confirmedMeanPerp = 0.0;
+                vector<double> tmpErrs;
+                vector<double> tmpCoords;
+                const double confirmedNormalCost =
+                    computeRobustCost(edges1, edges2, xCandidate, confirmedMeanPerp, &tmpErrs, &tmpCoords, axis);
+                if (std::abs(confirmedMeanPerp) > max_perp_threshold) {
+                    continue;
+                }
+
+                TransformResult preciseCandidate = summary.candidate;
+                if (axis == TransformResult::AlignAxis::X)
+                {
+                    preciseCandidate.dy = confirmedMeanPerp;
+                }
+                else
+                {
+                    preciseCandidate.dx = confirmedMeanPerp;
+                }
+
+                const TangentMatchCost confirmedTangentCost =
+                    computeTangentMatchCost(edges1, edges2, preciseCandidate,
+                                            tangent_residual_cost_weight,
+                                            tangent_correlation_cost_weight,
+                                            true);
+                const double confirmedCost = confirmedNormalCost + confirmedTangentCost.total();
+                if (confirmedCost < bestFinePrecise.score) {
+                    bestFinePrecise.score = confirmedCost;
+                    bestFinePrecise.normalMatchCost = confirmedNormalCost;
+                    bestFinePrecise.tangentResidualMatchCost = confirmedTangentCost.residualCost;
+                    bestFinePrecise.tangentCorrelationMatchCost = confirmedTangentCost.correlationCost;
+                    bestFinePrecise.dx = preciseCandidate.dx;
+                    bestFinePrecise.dy = preciseCandidate.dy;
+                    bestFinePrecise.axis = axis;
+                    bestFinePrecise.inlierErrors = std::move(tmpErrs);
+                    bestFinePrecise.inlierCoordinates = std::move(tmpCoords);
+                }
+            }
+
+            if (bestFinePrecise.score < 1e8) {
+                res = std::move(bestFinePrecise);
             }
         }
+        fineEnd = std::chrono::steady_clock::now();
 
         // --- 抛物线亚像素精化 ---
         // 在精细网格搜索(fineStep=0.1 px)后，对最优候选做三点抛物线插值
         // 使平移精度从 ~0.1 px 提升至 ~0.01 px
         {
+            refineBegin = std::chrono::steady_clock::now();
             const double xBest = (axis == TransformResult::AlignAxis::X) ? res.dx : res.dy;
             double meanPerpLeft = 0.0;
             double meanPerpRight = 0.0;
@@ -963,7 +1359,8 @@ TransformResult computeGlobalAlignment(const vector<Point2d>& edges1,
                             const TangentMatchCost refinedTangent =
                                 computeTangentMatchCost(edges1, edges2, refined,
                                                         tangent_residual_cost_weight,
-                                                        tangent_correlation_cost_weight);
+                                                        tangent_correlation_cost_weight,
+                                                        true);
                             const double refinedCost = normalCostRefined + refinedTangent.total();
 
                             if (refinedCost < res.score) {
@@ -980,8 +1377,17 @@ TransformResult computeGlobalAlignment(const vector<Point2d>& edges1,
                     }
                 }
             }
+            refineEnd = std::chrono::steady_clock::now();
         }
     }
+
+    res.profilingCoarseEvaluations = coarseEvaluations;
+    res.profilingCoarseAccepted = coarseAccepted;
+    res.profilingFineEvaluations = fineEvaluations;
+    res.profilingFineAccepted = fineAccepted;
+    res.profilingCoarseSeconds = std::chrono::duration<double>(coarseEnd - coarseBegin).count();
+    res.profilingFineSeconds = std::chrono::duration<double>(fineEnd - fineBegin).count();
+    res.profilingRefineSeconds = std::chrono::duration<double>(refineEnd - refineBegin).count();
 
     return res;
 }
@@ -1009,6 +1415,18 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
     TransformResult res;
     res.score = 1e9;
     res.direction = "N/A";
+    int totalAlignmentCalls = 0;
+    int totalMetricCalls = 0;
+    int totalRotationIterations = 0;
+    int totalCoarseEvaluations = 0;
+    int totalCoarseAccepted = 0;
+    int totalFineEvaluations = 0;
+    int totalFineAccepted = 0;
+    double totalAlignmentSeconds = 0.0;
+    double totalMetricSeconds = 0.0;
+    double totalCoarseSeconds = 0.0;
+    double totalFineSeconds = 0.0;
+    double totalRefineSeconds = 0.0;
 
     const double approx_x_local = std::abs(approx_shift);
     const double approx_y_local = std::abs(approx_shift_y);
@@ -1034,6 +1452,14 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
     const auto directionAllowed = [&](MotionPriorDirection candidate) {
         return direction_constraint == MotionPriorDirection::Auto || direction_constraint == candidate;
     };
+    const bool allowXPositive = directionAllowed(MotionPriorDirection::XPositive);
+    const bool allowXNegative = directionAllowed(MotionPriorDirection::XNegative);
+    const bool allowYPositive = directionAllowed(MotionPriorDirection::YPositive);
+    const bool allowYNegative = directionAllowed(MotionPriorDirection::YNegative);
+    const bool needPositiveXView = allowXPositive || allowXNegative;
+    const bool needPositiveYView = allowYPositive || allowYNegative;
+    const bool needNegativeXView = allowXNegative;
+    const bool needNegativeYView = allowYNegative;
 
     bool nearStraightSegment = false;
 
@@ -1180,40 +1606,68 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
 
     for (double ang = rotationMin; ang <= rotationMax + 1e-12; ang += rotationStep)
     {
+        ++totalRotationIterations;
         vector<Point2d> rotated_edges2;
-        rotatePoints(next_edges.raw, rotated_edges2, ang, center);
-        sortContourByX(rotated_edges2);
+        if (needPositiveXView) {
+            rotatePoints(next_edges.raw, rotated_edges2, ang, center);
+            sortContourByX(rotated_edges2);
+        }
 
         vector<Point2d> rotated_edges2_y;
-        rotatePoints(next_edges.raw, rotated_edges2_y, ang, center);
-        sortContourByY(rotated_edges2_y);
+        if (needPositiveYView) {
+            if (needPositiveXView) {
+                rotated_edges2_y = rotated_edges2;
+            } else {
+                rotatePoints(next_edges.raw, rotated_edges2_y, ang, center);
+            }
+            sortContourByY(rotated_edges2_y);
+        }
 
-        const Point2d centerNegX(-center.x, center.y);
         vector<Point2d> rotated_edges2_negX;
-        rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, ang, centerNegX);
-        sortContourByX(rotated_edges2_negX);
+        if (needNegativeXView) {
+            const Point2d centerNegX(-center.x, center.y);
+            rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, ang, centerNegX);
+            sortContourByX(rotated_edges2_negX);
+        }
 
-        const Point2d centerNegY(center.x, -center.y);
         vector<Point2d> rotated_edges2_negY;
-        rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, ang, centerNegY);
-        sortContourByY(rotated_edges2_negY);
+        if (needNegativeYView) {
+            const Point2d centerNegY(center.x, -center.y);
+            rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, ang, centerNegY);
+            sortContourByY(rotated_edges2_negY);
+        }
 
         TransformResult curBest;
         curBest.score = 1e9;
         string winnerLabel = "N/A";
 
-        if (directionAllowed(MotionPriorDirection::XPositive)) {
+        if (allowXPositive) {
             const double maxPerpThreshold = resolveMaxPerpThreshold(TransformResult::AlignAxis::X);
+            const auto alignmentBegin = std::chrono::steady_clock::now();
             TransformResult cur = computeGlobalAlignment(prev_edges.x_sorted, rotated_edges2,
                                                          approx_x_local, search_range_x, maxPerpThreshold,
                                                          TransformResult::AlignAxis::X,
                                                          tangent_residual_cost_weight,
                                                          tangent_correlation_cost_weight);
+            const auto alignmentEnd = std::chrono::steady_clock::now();
+            ++totalAlignmentCalls;
+            totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+            totalCoarseEvaluations += cur.profilingCoarseEvaluations;
+            totalCoarseAccepted += cur.profilingCoarseAccepted;
+            totalFineEvaluations += cur.profilingFineEvaluations;
+            totalFineAccepted += cur.profilingFineAccepted;
+            totalCoarseSeconds += cur.profilingCoarseSeconds;
+            totalFineSeconds += cur.profilingFineSeconds;
+            totalRefineSeconds += cur.profilingRefineSeconds;
             cur.da = ang;
             if (violates_motion_continuity(cur, ang)) {
                 cur.score = 1e9;
             }
+            const auto metricsBegin = std::chrono::steady_clock::now();
             populateAlignmentMetrics(prev_edges.x_sorted, rotated_edges2, cur);
+            const auto metricsEnd = std::chrono::steady_clock::now();
+            ++totalMetricCalls;
+            totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
             apply_direction_penalty(cur);
             apply_motion_continuity_penalty(cur);
             captureCandidate("X+", cur);
@@ -1224,19 +1678,34 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
             }
         }
 
-        if (directionAllowed(MotionPriorDirection::XNegative)) {
+        if (allowXNegative) {
             const double maxPerpThreshold = resolveMaxPerpThreshold(TransformResult::AlignAxis::X);
+            const auto alignmentBegin = std::chrono::steady_clock::now();
             TransformResult curXrev = computeGlobalAlignment(prev_edges.negX_sorted, rotated_edges2_negX,
                                                              -approx_x_local, search_range_x, maxPerpThreshold,
                                                              TransformResult::AlignAxis::X,
                                                              tangent_residual_cost_weight,
                                                              tangent_correlation_cost_weight);
+            const auto alignmentEnd = std::chrono::steady_clock::now();
+            ++totalAlignmentCalls;
+            totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+            totalCoarseEvaluations += curXrev.profilingCoarseEvaluations;
+            totalCoarseAccepted += curXrev.profilingCoarseAccepted;
+            totalFineEvaluations += curXrev.profilingFineEvaluations;
+            totalFineAccepted += curXrev.profilingFineAccepted;
+            totalCoarseSeconds += curXrev.profilingCoarseSeconds;
+            totalFineSeconds += curXrev.profilingFineSeconds;
+            totalRefineSeconds += curXrev.profilingRefineSeconds;
             curXrev.dx = -curXrev.dx;
             curXrev.da = ang;
             if (violates_motion_continuity(curXrev, ang)) {
                 curXrev.score = 1e9;
             }
+            const auto metricsBegin = std::chrono::steady_clock::now();
             populateAlignmentMetrics(prev_edges.x_sorted, rotated_edges2, curXrev);
+            const auto metricsEnd = std::chrono::steady_clock::now();
+            ++totalMetricCalls;
+            totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
             apply_direction_penalty(curXrev);
             apply_motion_continuity_penalty(curXrev);
             captureCandidate("X-", curXrev);
@@ -1247,18 +1716,33 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
             }
         }
 
-        if (directionAllowed(MotionPriorDirection::YPositive)) {
+        if (allowYPositive) {
             const double maxPerpThreshold = resolveMaxPerpThreshold(TransformResult::AlignAxis::Y);
+            const auto alignmentBegin = std::chrono::steady_clock::now();
             TransformResult curV = computeGlobalAlignment(prev_edges.y_sorted, rotated_edges2_y,
                                                           approx_y_local, search_range_y, maxPerpThreshold,
                                                           TransformResult::AlignAxis::Y,
                                                           tangent_residual_cost_weight,
                                                           tangent_correlation_cost_weight);
+            const auto alignmentEnd = std::chrono::steady_clock::now();
+            ++totalAlignmentCalls;
+            totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+            totalCoarseEvaluations += curV.profilingCoarseEvaluations;
+            totalCoarseAccepted += curV.profilingCoarseAccepted;
+            totalFineEvaluations += curV.profilingFineEvaluations;
+            totalFineAccepted += curV.profilingFineAccepted;
+            totalCoarseSeconds += curV.profilingCoarseSeconds;
+            totalFineSeconds += curV.profilingFineSeconds;
+            totalRefineSeconds += curV.profilingRefineSeconds;
             curV.da = ang;
             if (violates_motion_continuity(curV, ang)) {
                 curV.score = 1e9;
             }
+            const auto metricsBegin = std::chrono::steady_clock::now();
             populateAlignmentMetrics(prev_edges.y_sorted, rotated_edges2_y, curV);
+            const auto metricsEnd = std::chrono::steady_clock::now();
+            ++totalMetricCalls;
+            totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
             apply_direction_penalty(curV);
             apply_motion_continuity_penalty(curV);
             captureCandidate("Y+", curV);
@@ -1269,19 +1753,34 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
             }
         }
 
-        if (directionAllowed(MotionPriorDirection::YNegative)) {
+        if (allowYNegative) {
             const double maxPerpThreshold = resolveMaxPerpThreshold(TransformResult::AlignAxis::Y);
+            const auto alignmentBegin = std::chrono::steady_clock::now();
             TransformResult curYrev = computeGlobalAlignment(prev_edges.negY_sorted, rotated_edges2_negY,
                                                              -approx_y_local, search_range_y, maxPerpThreshold,
                                                              TransformResult::AlignAxis::Y,
                                                              tangent_residual_cost_weight,
                                                              tangent_correlation_cost_weight);
+            const auto alignmentEnd = std::chrono::steady_clock::now();
+            ++totalAlignmentCalls;
+            totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+            totalCoarseEvaluations += curYrev.profilingCoarseEvaluations;
+            totalCoarseAccepted += curYrev.profilingCoarseAccepted;
+            totalFineEvaluations += curYrev.profilingFineEvaluations;
+            totalFineAccepted += curYrev.profilingFineAccepted;
+            totalCoarseSeconds += curYrev.profilingCoarseSeconds;
+            totalFineSeconds += curYrev.profilingFineSeconds;
+            totalRefineSeconds += curYrev.profilingRefineSeconds;
             curYrev.dy = -curYrev.dy;
             curYrev.da = ang;
             if (violates_motion_continuity(curYrev, ang)) {
                 curYrev.score = 1e9;
             }
+            const auto metricsBegin = std::chrono::steady_clock::now();
             populateAlignmentMetrics(prev_edges.y_sorted, rotated_edges2_y, curYrev);
+            const auto metricsEnd = std::chrono::steady_clock::now();
+            ++totalMetricCalls;
+            totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
             apply_direction_penalty(curYrev);
             apply_motion_continuity_penalty(curYrev);
             captureCandidate("Y-", curYrev);
@@ -1309,28 +1808,40 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
         for (double ang = fallbackRotationMin; ang <= fallbackRotationMax + 1e-12; ang += fallbackRotationStep)
         {
             vector<Point2d> rotated_edges2;
-            rotatePoints(next_edges.raw, rotated_edges2, ang, center);
-            sortContourByX(rotated_edges2);
+            if (needPositiveXView) {
+                rotatePoints(next_edges.raw, rotated_edges2, ang, center);
+                sortContourByX(rotated_edges2);
+            }
 
             vector<Point2d> rotated_edges2_y;
-            rotatePoints(next_edges.raw, rotated_edges2_y, ang, center);
-            sortContourByY(rotated_edges2_y);
+            if (needPositiveYView) {
+                if (needPositiveXView) {
+                    rotated_edges2_y = rotated_edges2;
+                } else {
+                    rotatePoints(next_edges.raw, rotated_edges2_y, ang, center);
+                }
+                sortContourByY(rotated_edges2_y);
+            }
 
-            const Point2d centerNegX(-center.x, center.y);
             vector<Point2d> rotated_edges2_negX;
-            rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, ang, centerNegX);
-            sortContourByX(rotated_edges2_negX);
+            if (needNegativeXView) {
+                const Point2d centerNegX(-center.x, center.y);
+                rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, ang, centerNegX);
+                sortContourByX(rotated_edges2_negX);
+            }
 
-            const Point2d centerNegY(center.x, -center.y);
             vector<Point2d> rotated_edges2_negY;
-            rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, ang, centerNegY);
-            sortContourByY(rotated_edges2_negY);
+            if (needNegativeYView) {
+                const Point2d centerNegY(center.x, -center.y);
+                rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, ang, centerNegY);
+                sortContourByY(rotated_edges2_negY);
+            }
 
             TransformResult curBest;
             curBest.score = 1e9;
             string winnerLabel = "N/A";
 
-            if (directionAllowed(MotionPriorDirection::XPositive)) {
+            if (allowXPositive) {
                 const double maxPerpThreshold = std::clamp(std::abs(approx_shift_y) + 24.0, 28.0, 42.0);
                 TransformResult cur = computeGlobalAlignment(prev_edges.x_sorted, rotated_edges2,
                                                              approx_x_local, fallbackSearchRangeX, maxPerpThreshold,
@@ -1349,7 +1860,7 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                 }
             }
 
-            if (directionAllowed(MotionPriorDirection::XNegative)) {
+            if (allowXNegative) {
                 const double maxPerpThreshold = std::clamp(std::abs(approx_shift_y) + 24.0, 28.0, 42.0);
                 TransformResult curXrev = computeGlobalAlignment(prev_edges.negX_sorted, rotated_edges2_negX,
                                                                  -approx_x_local, fallbackSearchRangeX, maxPerpThreshold,
@@ -1369,7 +1880,7 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                 }
             }
 
-            if (directionAllowed(MotionPriorDirection::YPositive)) {
+            if (allowYPositive) {
                 const double maxPerpThreshold = std::clamp(std::abs(approx_shift) + 24.0, 28.0, 42.0);
                 TransformResult curV = computeGlobalAlignment(prev_edges.y_sorted, rotated_edges2_y,
                                                               approx_y_local, fallbackSearchRangeY, maxPerpThreshold,
@@ -1388,7 +1899,7 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                 }
             }
 
-            if (directionAllowed(MotionPriorDirection::YNegative)) {
+            if (allowYNegative) {
                 const double maxPerpThreshold = std::clamp(std::abs(approx_shift) + 24.0, 28.0, 42.0);
                 TransformResult curYrev = computeGlobalAlignment(prev_edges.negY_sorted, rotated_edges2_negY,
                                                                  -approx_y_local, fallbackSearchRangeY, maxPerpThreshold,
@@ -1487,27 +1998,47 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                 TransformResult rebuilt;
                 rebuilt.score = 1e9;
                 const double refineSearchHalfRangePx = 6.0;
+                const bool rebuildNeedsPositiveX =
+                    candidate.direction == "X+" || candidate.direction == "X-";
+                const bool rebuildNeedsPositiveY =
+                    candidate.direction == "Y+" || candidate.direction == "Y-";
+                const bool rebuildNeedsNegativeX = candidate.direction == "X-";
+                const bool rebuildNeedsNegativeY = candidate.direction == "Y-";
 
                 vector<Point2d> rotated_edges2;
-                rotatePoints(next_edges.raw, rotated_edges2, candidate.da, center);
-                sortContourByX(rotated_edges2);
+                if (rebuildNeedsPositiveX) {
+                    rotatePoints(next_edges.raw, rotated_edges2, candidate.da, center);
+                    sortContourByX(rotated_edges2);
+                }
 
-                vector<Point2d> rotated_edges2_y = rotated_edges2;
-                sortContourByY(rotated_edges2_y);
+                vector<Point2d> rotated_edges2_y;
+                if (rebuildNeedsPositiveY) {
+                    if (rebuildNeedsPositiveX) {
+                        rotated_edges2_y = rotated_edges2;
+                    } else {
+                        rotatePoints(next_edges.raw, rotated_edges2_y, candidate.da, center);
+                    }
+                    sortContourByY(rotated_edges2_y);
+                }
 
-                const Point2d centerNegX(-center.x, center.y);
                 vector<Point2d> rotated_edges2_negX;
-                rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, candidate.da, centerNegX);
-                sortContourByX(rotated_edges2_negX);
+                if (rebuildNeedsNegativeX) {
+                    const Point2d centerNegX(-center.x, center.y);
+                    rotatePoints(next_edges.negX_sorted, rotated_edges2_negX, candidate.da, centerNegX);
+                    sortContourByX(rotated_edges2_negX);
+                }
 
-                const Point2d centerNegY(center.x, -center.y);
                 vector<Point2d> rotated_edges2_negY;
-                rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, candidate.da, centerNegY);
-                sortContourByY(rotated_edges2_negY);
+                if (rebuildNeedsNegativeY) {
+                    const Point2d centerNegY(center.x, -center.y);
+                    rotatePoints(next_edges.negY_sorted, rotated_edges2_negY, candidate.da, centerNegY);
+                    sortContourByY(rotated_edges2_negY);
+                }
 
                 if (candidate.direction == "X+") {
                     const double maxPerpThreshold =
                         std::max(resolveMaxPerpThreshold(AlignmentAxis::X), std::abs(candidate.dy) + 6.0);
+                    const auto alignmentBegin = std::chrono::steady_clock::now();
                     rebuilt = computeGlobalAlignment(prev_edges.x_sorted,
                                                      rotated_edges2,
                                                      candidate.dx,
@@ -1516,11 +2047,26 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                                                      TransformResult::AlignAxis::X,
                                                      tangent_residual_cost_weight,
                                                      tangent_correlation_cost_weight);
+                    const auto alignmentEnd = std::chrono::steady_clock::now();
+                    ++totalAlignmentCalls;
+                    totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+                    totalCoarseEvaluations += rebuilt.profilingCoarseEvaluations;
+                    totalCoarseAccepted += rebuilt.profilingCoarseAccepted;
+                    totalFineEvaluations += rebuilt.profilingFineEvaluations;
+                    totalFineAccepted += rebuilt.profilingFineAccepted;
+                    totalCoarseSeconds += rebuilt.profilingCoarseSeconds;
+                    totalFineSeconds += rebuilt.profilingFineSeconds;
+                    totalRefineSeconds += rebuilt.profilingRefineSeconds;
                     rebuilt.da = candidate.da;
+                    const auto metricsBegin = std::chrono::steady_clock::now();
                     populateAlignmentMetrics(prev_edges.x_sorted, rotated_edges2, rebuilt);
+                    const auto metricsEnd = std::chrono::steady_clock::now();
+                    ++totalMetricCalls;
+                    totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
                 } else if (candidate.direction == "X-") {
                     const double maxPerpThreshold =
                         std::max(resolveMaxPerpThreshold(AlignmentAxis::X), std::abs(candidate.dy) + 6.0);
+                    const auto alignmentBegin = std::chrono::steady_clock::now();
                     rebuilt = computeGlobalAlignment(prev_edges.negX_sorted,
                                                      rotated_edges2_negX,
                                                      -candidate.dx,
@@ -1529,12 +2075,27 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                                                      TransformResult::AlignAxis::X,
                                                      tangent_residual_cost_weight,
                                                      tangent_correlation_cost_weight);
+                    const auto alignmentEnd = std::chrono::steady_clock::now();
+                    ++totalAlignmentCalls;
+                    totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+                    totalCoarseEvaluations += rebuilt.profilingCoarseEvaluations;
+                    totalCoarseAccepted += rebuilt.profilingCoarseAccepted;
+                    totalFineEvaluations += rebuilt.profilingFineEvaluations;
+                    totalFineAccepted += rebuilt.profilingFineAccepted;
+                    totalCoarseSeconds += rebuilt.profilingCoarseSeconds;
+                    totalFineSeconds += rebuilt.profilingFineSeconds;
+                    totalRefineSeconds += rebuilt.profilingRefineSeconds;
                     rebuilt.dx = -rebuilt.dx;
                     rebuilt.da = candidate.da;
+                    const auto metricsBegin = std::chrono::steady_clock::now();
                     populateAlignmentMetrics(prev_edges.x_sorted, rotated_edges2, rebuilt);
+                    const auto metricsEnd = std::chrono::steady_clock::now();
+                    ++totalMetricCalls;
+                    totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
                 } else if (candidate.direction == "Y+") {
                     const double maxPerpThreshold =
                         std::max(resolveMaxPerpThreshold(AlignmentAxis::Y), std::abs(candidate.dx) + 6.0);
+                    const auto alignmentBegin = std::chrono::steady_clock::now();
                     rebuilt = computeGlobalAlignment(prev_edges.y_sorted,
                                                      rotated_edges2_y,
                                                      candidate.dy,
@@ -1543,11 +2104,26 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                                                      TransformResult::AlignAxis::Y,
                                                      tangent_residual_cost_weight,
                                                      tangent_correlation_cost_weight);
+                    const auto alignmentEnd = std::chrono::steady_clock::now();
+                    ++totalAlignmentCalls;
+                    totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+                    totalCoarseEvaluations += rebuilt.profilingCoarseEvaluations;
+                    totalCoarseAccepted += rebuilt.profilingCoarseAccepted;
+                    totalFineEvaluations += rebuilt.profilingFineEvaluations;
+                    totalFineAccepted += rebuilt.profilingFineAccepted;
+                    totalCoarseSeconds += rebuilt.profilingCoarseSeconds;
+                    totalFineSeconds += rebuilt.profilingFineSeconds;
+                    totalRefineSeconds += rebuilt.profilingRefineSeconds;
                     rebuilt.da = candidate.da;
+                    const auto metricsBegin = std::chrono::steady_clock::now();
                     populateAlignmentMetrics(prev_edges.y_sorted, rotated_edges2_y, rebuilt);
+                    const auto metricsEnd = std::chrono::steady_clock::now();
+                    ++totalMetricCalls;
+                    totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
                 } else if (candidate.direction == "Y-") {
                     const double maxPerpThreshold =
                         std::max(resolveMaxPerpThreshold(AlignmentAxis::Y), std::abs(candidate.dx) + 6.0);
+                    const auto alignmentBegin = std::chrono::steady_clock::now();
                     rebuilt = computeGlobalAlignment(prev_edges.negY_sorted,
                                                      rotated_edges2_negY,
                                                      -candidate.dy,
@@ -1556,9 +2132,23 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
                                                      TransformResult::AlignAxis::Y,
                                                      tangent_residual_cost_weight,
                                                      tangent_correlation_cost_weight);
+                    const auto alignmentEnd = std::chrono::steady_clock::now();
+                    ++totalAlignmentCalls;
+                    totalAlignmentSeconds += std::chrono::duration<double>(alignmentEnd - alignmentBegin).count();
+                    totalCoarseEvaluations += rebuilt.profilingCoarseEvaluations;
+                    totalCoarseAccepted += rebuilt.profilingCoarseAccepted;
+                    totalFineEvaluations += rebuilt.profilingFineEvaluations;
+                    totalFineAccepted += rebuilt.profilingFineAccepted;
+                    totalCoarseSeconds += rebuilt.profilingCoarseSeconds;
+                    totalFineSeconds += rebuilt.profilingFineSeconds;
+                    totalRefineSeconds += rebuilt.profilingRefineSeconds;
                     rebuilt.dy = -rebuilt.dy;
                     rebuilt.da = candidate.da;
+                    const auto metricsBegin = std::chrono::steady_clock::now();
                     populateAlignmentMetrics(prev_edges.y_sorted, rotated_edges2_y, rebuilt);
+                    const auto metricsEnd = std::chrono::steady_clock::now();
+                    ++totalMetricCalls;
+                    totalMetricSeconds += std::chrono::duration<double>(metricsEnd - metricsBegin).count();
                 }
 
                 if (rebuilt.hasCandidate()) {
@@ -1592,6 +2182,18 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
     if (candidateDiagnostics.size() > 20) {
         candidateDiagnostics.resize(20);
     }
+    std::ostringstream profiling;
+    profiling << "matchOnePair profile: rotations=" << totalRotationIterations
+              << ", alignmentCalls=" << totalAlignmentCalls
+              << ", metricCalls=" << totalMetricCalls
+              << ", coarseEval/accept=" << totalCoarseEvaluations << "/" << totalCoarseAccepted
+              << ", fineEval/accept=" << totalFineEvaluations << "/" << totalFineAccepted
+              << ", alignment=" << totalAlignmentSeconds << " s"
+              << " [coarse=" << totalCoarseSeconds
+              << " s, fine=" << totalFineSeconds
+              << " s, refine=" << totalRefineSeconds << " s]"
+              << ", metrics=" << totalMetricSeconds << " s";
+    res.profilingSummary = profiling.str();
     res.candidateDiagnostics = std::move(candidateDiagnostics);
 
     return res;

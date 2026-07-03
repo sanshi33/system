@@ -4,6 +4,7 @@
 #include <QGraphicsScene>
 #include <QGraphicsView>
 #include <QImage>
+#include <QSize>
 
 class QMouseEvent;
 class QPainter;
@@ -18,6 +19,7 @@ public:
 
     void setImage(const QImage& image);
     void clearImage();
+    [[nodiscard]] QSize recommendedExportPixelSize() const;
 
 protected:
     void resizeEvent(QResizeEvent* event) override;

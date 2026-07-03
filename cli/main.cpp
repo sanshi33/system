@@ -1,4 +1,5 @@
 #include "app/StitchWorkflowService.h"
+#include "cad_model/CadModelLoader.h"
 #include "common/ResultPathUtils.h"
 #include "registration/RegistrationTypes.h"
 
@@ -7,6 +8,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -43,6 +46,57 @@ namespace
                        [](unsigned char ch)
                        { return static_cast<char>(std::tolower(ch)); });
         return value;
+    }
+
+    std::filesystem::path cadPathFromArgument(const std::string &pathText)
+    {
+        std::error_code error;
+        std::filesystem::path utf8Path;
+        bool hasUtf8Path = false;
+        try {
+            utf8Path = std::filesystem::u8path(pathText);
+            hasUtf8Path = true;
+            if (std::filesystem::exists(utf8Path, error)) {
+                return utf8Path;
+            }
+        } catch (const std::exception &) {
+            hasUtf8Path = false;
+        }
+
+#if defined(_WIN32)
+        error.clear();
+        std::filesystem::path nativePath(pathText);
+        if (std::filesystem::exists(nativePath, error)) {
+            return nativePath;
+        }
+#endif
+
+        if (hasUtf8Path) {
+            return utf8Path;
+        }
+        return std::filesystem::path(pathText);
+    }
+
+    bool writeCadSamplesCsv(const std::filesystem::path& path,
+                            const std::vector<pinjie::cad_design::DesignProfileSample>& samples)
+    {
+        std::ofstream stream(path, std::ios::binary);
+        if (!stream) {
+            return false;
+        }
+        stream << "index,s_mm,r_mm,has_cad_point,cad_x_mm,cad_y_mm,cad_z_mm\n";
+        stream << std::fixed << std::setprecision(9);
+        std::size_t index = 0;
+        for (const auto& sample : samples) {
+            stream << index++ << ","
+                   << sample.sMm << ","
+                   << sample.rMm << ","
+                   << (sample.hasCadPoint ? 1 : 0) << ","
+                   << sample.cadXMm << ","
+                   << sample.cadYMm << ","
+                   << sample.cadZMm << "\n";
+        }
+        return true;
     }
 
     bool tryParseDouble(const std::string &text, double &value)
@@ -189,7 +243,7 @@ namespace
                         pinjie::MotionPriorDirection &directionConstraint,
                         ImageCollectionMode &imageCollectionMode)
     {
-        overlapRatio = 0.875;
+        overlapRatio = 0.75;
         tangentResidualWeight = 0.05;
         tangentCorrelationWeight = 0.25;
         enablePointFiltering = true;
@@ -340,6 +394,11 @@ namespace
         std::cout << "Usage:\n"
                   << "  " << argv0 << " <input_dir> <image_count> [--out <out_png>]\n"
                   << "               [--csv <out_csv>] [--debug-dir <process_dir>] [--no-process-vis]\n"
+                  << "               [--local-slot-mode] [--local-slot-bottom-width <mm>]\n"
+                  << "               [--local-slot-pixel-size <mm_per_px>] [--local-slot-pixel-scale <scale>]\n"
+                  << "  " << argv0 << " --local-slot-image <image_path> [--out <out_png>] [--csv <out_csv>]\n"
+                  << "               [--local-slot-bottom-width <mm>]\n"
+                  << "               [--local-slot-pixel-size <mm_per_px>] [--local-slot-pixel-scale <scale>]\n"
                   << "               [--preset {gui|pinjie-cli|stitch-app}] [--input-mode {scan|sequential}]\n"
                   << "               [--run-mode {full|registration}]\n"
                   << "               [--endpoint-probe-fast]\n"
@@ -353,7 +412,12 @@ namespace
                   << "               [--no-point-filter] [--filter-confidence-q <ratio_or_percent>]\n"
                   << "               [--filter-gradient-q <ratio_or_percent>] [--filter-window-radius <points>]\n"
                   << "               [--filter-hampel-sigma <sigma>] [--filter-hampel-min-scale <px>]\n"
-                  << "               defaults: --preset gui --input-mode scan --overlap 0.875\n"
+                  << "               [--cad <step_or_iges>] [--cad-axial X|Y|Z] [--cad-radial X|Y|Z]\n"
+                  << "               [--cad-step <mm>] [--cad-section-coordinate <mm>]\n"
+                  << "               [--cad-no-upper-envelope] [--cad-reverse-axial] [--cad-no-left-origin]\n"
+                  << "               [--target-slot-width <mm>] [--target-slot-depth <mm>]\n"
+                  << "               [--design-pixel-size <mm_per_px>]\n"
+                  << "               defaults: --preset gui --input-mode scan --overlap 0.75\n"
                   << "                         --direction x+ --search-range 200\n"
                   << "                         --rotation-range 0.5 --rotation-step 0.01\n"
                   << "                         tangent weights: residual=0.05, correlation=0.25\n"
@@ -479,8 +543,18 @@ int main(int argc, char **argv)
         }
     }
 
-    std::string inputDir = (argc >= 2) ? argv[1] : kDefaultInputDir;
-    int imageCount = (argc >= 3) ? std::atoi(argv[2]) : kDefaultImageCount;
+    const bool directLocalSlotImageMode =
+        argc >= 3 && std::string(argv[1]) == "--local-slot-image";
+    std::string directLocalSlotImagePath;
+    if (directLocalSlotImageMode)
+    {
+        directLocalSlotImagePath = argv[2];
+    }
+
+    std::string inputDir = directLocalSlotImageMode
+                               ? std::filesystem::path(directLocalSlotImagePath).parent_path().u8string()
+                               : ((argc >= 2) ? argv[1] : kDefaultInputDir);
+    int imageCount = directLocalSlotImageMode ? 1 : ((argc >= 3) ? std::atoi(argv[2]) : kDefaultImageCount);
 
     if (imageCount <= 0)
     {
@@ -489,7 +563,21 @@ int main(int argc, char **argv)
     }
 
     std::filesystem::path inputPath(inputDir);
-    if (!std::filesystem::exists(inputPath) || !std::filesystem::is_directory(inputPath))
+    if (directLocalSlotImageMode)
+    {
+        const std::filesystem::path localImagePath = std::filesystem::u8path(directLocalSlotImagePath);
+        if (!std::filesystem::exists(localImagePath) || !std::filesystem::is_regular_file(localImagePath))
+        {
+            std::cout << "[Error] Invalid local slot image: " << localImagePath.generic_string() << std::endl;
+            return -1;
+        }
+        if (inputDir.empty())
+        {
+            inputPath = std::filesystem::current_path();
+            inputDir = inputPath.u8string();
+        }
+    }
+    else if (!std::filesystem::exists(inputPath) || !std::filesystem::is_directory(inputPath))
     {
         std::cout << "[Error] Invalid input directory: " << inputPath.generic_string() << std::endl;
         return -1;
@@ -510,7 +598,7 @@ int main(int argc, char **argv)
     std::filesystem::path csvPath = defaultResultPaths.csvPath;
     std::filesystem::path debugDir = defaultResultPaths.debugDir;
     int startIndex = 1;
-    double overlapRatio = 0.875;
+    double overlapRatio = 0.75;
     double baseSearchRange = 200.0;
     double rotationMinDeg = -0.5;
     double rotationMaxDeg = 0.5;
@@ -527,6 +615,13 @@ int main(int argc, char **argv)
     CliPreset preset = CliPreset::Gui;
     CliRunMode runMode = CliRunMode::Full;
     bool endpointProbeFastMode = false;
+    bool localSlotImageMode = directLocalSlotImageMode;
+    double localSlotBottomWidthMm = 0.05;
+    double localSlotPixelSizeOverrideMm = 0.001614;
+    double localSlotPixelSizeScale = 1.001;
+    int localSlotMaxOutputPoints = 1600;
+    bool useExternalCadModel = false;
+    pinjie::cad_model::DesignModelRequest cadRequest;
     ImageCollectionMode imageCollectionMode = ImageCollectionMode::ScanAllNatural;
     applyCliPreset(preset,
                    overlapRatio,
@@ -601,6 +696,58 @@ int main(int argc, char **argv)
         else if (arg == "--endpoint-probe-fast")
         {
             endpointProbeFastMode = true;
+        }
+        else if (arg == "--local-slot-mode")
+        {
+            localSlotImageMode = true;
+        }
+        else if ((arg == "--local-slot-bottom-width" || arg == "--local-slot-width") && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue <= 0.0)
+            {
+                std::cout << "[Error] local-slot-bottom-width must be a positive millimeter value.\n";
+                return -1;
+            }
+
+            localSlotBottomWidthMm = parsedValue;
+            localSlotImageMode = true;
+        }
+        else if (arg == "--local-slot-pixel-size" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue <= 0.0)
+            {
+                std::cout << "[Error] local-slot-pixel-size must be a positive mm/px value.\n";
+                return -1;
+            }
+
+            localSlotPixelSizeOverrideMm = parsedValue;
+            localSlotImageMode = true;
+        }
+        else if (arg == "--local-slot-pixel-scale" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue <= 0.0)
+            {
+                std::cout << "[Error] local-slot-pixel-scale must be a positive scale value.\n";
+                return -1;
+            }
+
+            localSlotPixelSizeScale = parsedValue;
+            localSlotImageMode = true;
+        }
+        else if (arg == "--local-slot-max-points" && i + 1 < argc)
+        {
+            int parsedValue = 0;
+            if (!tryParseInt(argv[++i], parsedValue) || parsedValue < 50)
+            {
+                std::cout << "[Error] local-slot-max-points must be an integer >= 50.\n";
+                return -1;
+            }
+
+            localSlotMaxOutputPoints = parsedValue;
+            localSlotImageMode = true;
         }
         else if (arg == "--input-mode" && i + 1 < argc)
         {
@@ -796,6 +943,99 @@ int main(int argc, char **argv)
 
             filterHampelMinScale = parsedValue;
         }
+        else if (arg == "--cad" && i + 1 < argc)
+        {
+            cadRequest.cadFilePath = argv[++i];
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-axial" && i + 1 < argc)
+        {
+            cadRequest.axialAxis = argv[++i];
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-radial" && i + 1 < argc)
+        {
+            cadRequest.radialAxis = argv[++i];
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-step" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue <= 0.0)
+            {
+                std::cout << "[Error] cad-step must be a positive millimeter value.\n";
+                return -1;
+            }
+
+            cadRequest.profileSamplingStepMm = parsedValue;
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-section-coordinate" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue))
+            {
+                std::cout << "[Error] cad-section-coordinate must be a number.\n";
+                return -1;
+            }
+
+            cadRequest.sectionCoordinateMm = parsedValue;
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-no-upper-envelope")
+        {
+            cadRequest.extractUpperEnvelope = false;
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-forward-z")
+        {
+            // Legacy alias kept for old scripts; external CAD now defaults to forward axial expansion.
+            cadRequest.reverseAxialDirection = false;
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-reverse-axial")
+        {
+            cadRequest.reverseAxialDirection = true;
+            useExternalCadModel = true;
+        }
+        else if (arg == "--cad-no-left-origin")
+        {
+            cadRequest.useLeftEndpointAsOrigin = false;
+            useExternalCadModel = true;
+        }
+        else if (arg == "--target-slot-width" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue < 0.0)
+            {
+                std::cout << "[Error] target-slot-width must be a non-negative millimeter value.\n";
+                return -1;
+            }
+
+            cadRequest.targetSlotWidthMm = parsedValue;
+        }
+        else if (arg == "--target-slot-depth" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue < 0.0)
+            {
+                std::cout << "[Error] target-slot-depth must be a non-negative millimeter value.\n";
+                return -1;
+            }
+
+            cadRequest.targetSlotDepthMm = parsedValue;
+        }
+        else if (arg == "--design-pixel-size" && i + 1 < argc)
+        {
+            double parsedValue = 0.0;
+            if (!tryParseDouble(argv[++i], parsedValue) || parsedValue <= 0.0)
+            {
+                std::cout << "[Error] design-pixel-size must be a positive mm/px value.\n";
+                return -1;
+            }
+
+            cadRequest.temporaryPixelSizeMm = parsedValue;
+        }
         else if (arg == "--help" || arg == "-h")
         {
             printUsage(argv[0]);
@@ -817,6 +1057,13 @@ int main(int argc, char **argv)
                                rotationMinDeg,
                                rotationMaxDeg,
                                rotationStepDeg);
+    if (localSlotImageMode)
+    {
+        std::cout << "[Config] local-slot-mode=on, bottom-width=" << localSlotBottomWidthMm
+                  << " mm, pixel-size-override=" << localSlotPixelSizeOverrideMm
+                  << " mm/px, pixel-scale=" << localSlotPixelSizeScale
+                  << ", max-points=" << localSlotMaxOutputPoints << '\n';
+    }
 
     panoramaPath = pinjie::resolveResultPathUnderBase(panoramaPath, defaultResultPaths.runDir);
     const std::filesystem::path outputDir =
@@ -857,12 +1104,16 @@ int main(int argc, char **argv)
 
     pinjie::StitchRunRequest request;
     std::string imageCollectionError;
-    if (!collectImagePaths(inputPath,
-                           imageCount,
-                           startIndex,
-                           imageCollectionMode,
-                           request.imagePaths,
-                           imageCollectionError))
+    if (directLocalSlotImageMode)
+    {
+        request.imagePaths = {std::filesystem::u8path(directLocalSlotImagePath).u8string()};
+    }
+    else if (!collectImagePaths(inputPath,
+                                imageCount,
+                                startIndex,
+                                imageCollectionMode,
+                                request.imagePaths,
+                                imageCollectionError))
     {
         std::cout << "[Error] " << imageCollectionError << std::endl;
         return -1;
@@ -887,8 +1138,72 @@ int main(int argc, char **argv)
     request.pipelineConfig.tangentResidualCostWeight = tangentResidualWeight;
     request.pipelineConfig.tangentCorrelationCostWeight = tangentCorrelationWeight;
     request.pipelineConfig.generateDebugVisualization = saveDebugVisualization;
-    request.pipelineConfig.enableDesignComparison = runMode != CliRunMode::Registration;
+    request.pipelineConfig.enableDesignComparison =
+        runMode != CliRunMode::Registration && useExternalCadModel;
     request.pipelineConfig.endpointProbeFastMode = endpointProbeFastMode;
+    request.pipelineConfig.designTargetSlotWidthMm = cadRequest.targetSlotWidthMm;
+    request.pipelineConfig.designTargetSlotDepthMm = cadRequest.targetSlotDepthMm;
+    request.pipelineConfig.localSlotImageMode = localSlotImageMode;
+    request.pipelineConfig.localSlotBottomWidthMm = localSlotBottomWidthMm;
+    request.pipelineConfig.localSlotPixelSizeOverrideMm = localSlotPixelSizeOverrideMm;
+    request.pipelineConfig.localSlotPixelSizeScale = localSlotPixelSizeScale;
+    request.pipelineConfig.localSlotMaxOutputPoints =
+        static_cast<std::size_t>(std::max(50, localSlotMaxOutputPoints));
+    if (localSlotImageMode && request.pipelineConfig.designTargetSlotWidthMm <= 0.0)
+    {
+        request.pipelineConfig.designTargetSlotWidthMm = localSlotBottomWidthMm;
+    }
+    if (cadRequest.temporaryPixelSizeMm > 0.0)
+    {
+        request.pipelineConfig.designPixelSizeMm = cadRequest.temporaryPixelSizeMm;
+        request.pipelineConfig.designFilterEndFaceEdges = false;
+        std::cout << "[Info] Temporary design pixel size enabled: "
+                  << cadRequest.temporaryPixelSizeMm
+                  << " mm/px; design end-face filtering disabled for this test run.\n";
+    }
+    if (useExternalCadModel)
+    {
+        if (cadRequest.cadFilePath.empty())
+        {
+            std::cout << "[Error] --cad is required when CAD options are used.\n";
+            return -1;
+        }
+        if (localSlotImageMode && cadRequest.targetSlotWidthMm <= 0.0) {
+            cadRequest.targetSlotWidthMm = localSlotBottomWidthMm;
+        }
+
+        const pinjie::cad_model::CadModelLoadResult cadResult =
+            pinjie::cad_model::loadCadModelDocument(cadPathFromArgument(cadRequest.cadFilePath), cadRequest);
+        std::cout << pinjie::cad_model::buildCadModelSummaryText(cadResult.document);
+        if (!cadResult.ok || !cadResult.document.hasProfileSamples ||
+            cadResult.document.profileSamples.size() < 2)
+        {
+            std::cout << "[Error] Failed to load usable CAD profile: " << cadResult.message << "\n";
+            return -1;
+        }
+
+        request.pipelineConfig.designUseExternalProfile = true;
+        request.pipelineConfig.designExternalProfileSamples =
+            localSlotImageMode && cadResult.document.hasSectionSamples &&
+                    cadResult.document.sectionSamples.size() >= 2
+                ? cadResult.document.sectionSamples
+                : cadResult.document.profileSamples;
+        request.pipelineConfig.designProfileMetadata = cadResult.document.profileMetadata;
+        request.pipelineConfig.designReverseAxial = cadRequest.reverseAxialDirection;
+        request.pipelineConfig.designUseLeftEndpointAnchor = cadRequest.useLeftEndpointAsOrigin;
+        request.pipelineConfig.designAnchorRadialToLeftEndpoint = cadRequest.useLeftEndpointAsOrigin;
+        request.pipelineConfig.designUseUpperEnvelope = cadRequest.extractUpperEnvelope;
+        request.pipelineConfig.designIgnoreStepTransition = false;
+        request.pipelineConfig.designUseCentralSlotImageRoi = false;
+        if (!cadResult.document.sectionSamples.empty()) {
+            writeCadSamplesCsv(outputDir / "cad_section_samples.csv", cadResult.document.sectionSamples);
+        }
+        if (!cadResult.document.profileSamples.empty()) {
+            writeCadSamplesCsv(outputDir / "cad_profile_samples.csv", cadResult.document.profileSamples);
+        }
+        std::cout << "[Info] External CAD design profile enabled: "
+                  << request.pipelineConfig.designExternalProfileSamples.size() << " samples.\n";
+    }
     request.resultOutputDir = pinjie::genericUtf8String(outputDir);
     request.panoramaOutputPath = panoramaPath.u8string();
     request.csvOutputPath = csvPath.u8string();
@@ -896,19 +1211,40 @@ int main(int argc, char **argv)
         pinjie::genericUtf8String(outputDir / "alignment_candidate_diagnostics.csv");
     if (runMode == CliRunMode::Full)
     {
-        request.designErrorProfileCsvOutputPath =
-            pinjie::genericUtf8String(outputDir / "design_error_profile.csv");
-        request.designErrorSummaryCsvOutputPath =
-            pinjie::genericUtf8String(outputDir / "design_error_summary.csv");
-        request.designComparisonOverlayOutputPath =
-            pinjie::genericUtf8String(outputDir / "design_comparison_overlay.png");
-        request.qualityReviewCsvOutputPath =
-            pinjie::genericUtf8String(outputDir / "quality_review.csv");
-        request.contourOverlayOutputPath = pinjie::genericUtf8String(outputDir / "origin_contour_overlay.png");
-        request.tangentCorrelationAllOutputPath =
-            pinjie::genericUtf8String(outputDir / "tangent_correlation_all.png");
-        request.tangentCorrelationInlierOutputPath =
-            pinjie::genericUtf8String(outputDir / "tangent_correlation_inlier.png");
+        request.saveContourPointsCsv = true;
+        request.contourPointsCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "contour_points.csv");
+        request.originContourOverlayCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "origin_contour_overlay_points.csv");
+        request.saveStitchedContourProfileCsv = true;
+        request.stitchedContourProfileCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "stitched_contour_profile.csv");
+        request.saveTangentStepCsv = true;
+        request.tangentStepCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "tangent_correlation_by_step.csv");
+        request.saveNormalErrorProfileCsv = true;
+        request.normalErrorProfileCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "normal_error_profile.csv");
+        request.saveTangentProfileCsv = true;
+        request.tangentProfileCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "tangent_profile_compare.csv");
+        request.originTangentPointMetricsCsvOutputPath =
+            pinjie::genericUtf8String(outputDir / "origin_tangent_point_metrics.csv");
+        if (useExternalCadModel)
+        {
+            request.designErrorProfileCsvOutputPath =
+                pinjie::genericUtf8String(outputDir / "design_error_profile.csv");
+            request.designErrorSummaryCsvOutputPath =
+                pinjie::genericUtf8String(outputDir / "design_error_summary.csv");
+            request.design3dErrorCsvOutputPath =
+                pinjie::genericUtf8String(outputDir / "design_3d_error_points.csv");
+            request.designCompensationCsvOutputPath =
+                pinjie::genericUtf8String(outputDir / "design_compensation.csv");
+            request.designFeatureCompensationCsvOutputPath =
+                pinjie::genericUtf8String(outputDir / "design_feature_compensation.csv");
+            request.qualityReviewCsvOutputPath =
+                pinjie::genericUtf8String(outputDir / "quality_review.csv");
+        }
     }
     if (saveDebugVisualization)
     {

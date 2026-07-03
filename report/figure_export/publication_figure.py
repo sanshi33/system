@@ -275,10 +275,10 @@ def build_used_dataframe(profile_df: pd.DataFrame) -> pd.DataFrame:
     return used_df
 
 
-def eval_design_compare(s_mm: float, reverse_z: bool = True) -> Optional[Tuple[float, float]]:
+def eval_design_compare(s_mm: float, reverse_axial: bool = False) -> Optional[Tuple[float, float]]:
     if not math.isfinite(float(s_mm)):
         return None
-    z_mm = _DESIGN_PROFILE_MAX_Z_MM - float(s_mm) if reverse_z else float(s_mm)
+    z_mm = _DESIGN_PROFILE_MAX_Z_MM - float(s_mm) if reverse_axial else float(s_mm)
     if z_mm < _DESIGN_PROFILE_MIN_Z_MM or z_mm > _DESIGN_PROFILE_MAX_Z_MM:
         return None
 
@@ -317,7 +317,7 @@ def eval_design_compare(s_mm: float, reverse_z: bool = True) -> Optional[Tuple[f
         radius = 179.919242
         dr_dz = 0.0
 
-    return radius, (-dr_dz if reverse_z else dr_dz)
+    return radius, (-dr_dz if reverse_axial else dr_dz)
 
 
 def build_display_dataframe(profile_df: pd.DataFrame,
@@ -350,13 +350,14 @@ def build_display_dataframe(profile_df: pd.DataFrame,
     display_df.sort_values("s_aligned_mm", inplace=True)
     display_df.reset_index(drop=True, inplace=True)
 
-    reverse_z = True
+    reverse_axial = False
     if summary_row is not None:
+        legacy_default = summary_row.get("design_reverse_z", 0)
         reverse_raw = pd.to_numeric(
-            pd.Series([summary_row.get("design_reverse_z", 1)]),
+            pd.Series([summary_row.get("design_reverse_axial", legacy_default)]),
             errors="coerce",
-        ).fillna(1.0).iloc[0]
-        reverse_z = float(reverse_raw) > 0.5
+        ).fillna(0.0).iloc[0]
+        reverse_axial = float(reverse_raw) > 0.5
 
     if "r_design_mm" in display_df.columns:
         design_display = np.array(display_df["r_design_mm"].to_numpy(dtype=float), copy=True)
@@ -367,7 +368,7 @@ def build_display_dataframe(profile_df: pd.DataFrame,
         s_values = display_df.loc[missing_design, "s_aligned_mm"].to_numpy(dtype=float)
         filled_values: List[float] = []
         for s_value in s_values:
-            eval_result = eval_design_compare(s_value, reverse_z)
+            eval_result = eval_design_compare(s_value, reverse_axial)
             filled_values.append(eval_result[0] if eval_result is not None else np.nan)
         filled = np.array(filled_values, dtype=float)
         design_display[missing_design] = filled
@@ -939,6 +940,12 @@ def draw_panel_metrics_table(ctx: PanelContext) -> None:
         value = summary.get(key, None)
         return fmt_metric(value, digits) if value is not None else "--"
 
+    reverse_axial_raw = pd.to_numeric(
+        pd.Series([summary.get("design_reverse_axial", summary.get("design_reverse_z", 0))]),
+        errors="coerce",
+    ).fillna(0.0).iloc[0]
+    reverse_axial_text = "yes" if int(float(reverse_axial_raw)) else "no"
+
     motion_diag = None
     if ctx.data.stitching_df is not None and not ctx.data.stitching_df.empty:
         rmse_col = _find_column(ctx.data.stitching_df, ["NormalRMSEInlier(px)", "NormalRMSEAll(px)",
@@ -951,7 +958,7 @@ def draw_panel_metrics_table(ctx: PanelContext) -> None:
     rows = [
         ("Sample", "Used points", str(int(float(_s("used_count", 0))))),
         ("", "Pixel size", f"{_s('pixel_size_mm', 4)} mm/px"),
-        ("", "Reverse Z", "yes" if int(float(_s("design_reverse_z", 0))) else "no"),
+        ("", "Reverse axial", reverse_axial_text),
         ("Normal", "Mean bias", f"{_s('mean_normal_error_um')} μm"),
         ("", "RMSE", f"{_s('normal_rmse_um')} μm"),
         ("", "P95", f"{_s('normal_p95_abs_um')} μm"),

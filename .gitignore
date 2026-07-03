@@ -31,6 +31,7 @@
 # Large local datasets / mounts
 /火焰筒/
 /std_sphere_input
+/test_cases/
 
 # Misc generated reports
 /*_quality_report.txt

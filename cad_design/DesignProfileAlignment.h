@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cad_design/DesignProfileTypes.h"
 #include "stitch/StitchTypes.h"
 
 #include <opencv2/core.hpp>
@@ -21,6 +22,19 @@ struct DesignErrorProfilePoint {
     double designRadiusMm{0.0};
     double nearestDesignSMm{0.0};
     double nearestDesignRMm{0.0};
+    bool hasCadCoordinates{false};
+    double nearestDesignCadXMm{0.0};
+    double nearestDesignCadYMm{0.0};
+    double nearestDesignCadZMm{0.0};
+    double measuredCadXMm{0.0};
+    double measuredCadYMm{0.0};
+    double measuredCadZMm{0.0};
+    double compensationTargetCadXMm{0.0};
+    double compensationTargetCadYMm{0.0};
+    double compensationTargetCadZMm{0.0};
+    double compensationDeltaCadXUm{0.0};
+    double compensationDeltaCadYUm{0.0};
+    double compensationDeltaCadZUm{0.0};
     std::size_t designSegmentIndex{0};
     double designDerivative{0.0};
     double radialErrorMm{0.0};
@@ -55,7 +69,7 @@ struct DesignErrorSummary {
     double absoluteBiasCorrectionUm{0.0};
     double preRefineMeanNormalErrorUm{0.0};
     double preRefineAbsoluteFilteredRmseUm{0.0};
-    bool designReverseZ{true};
+    bool designReverseAxial{false};
     bool useLeftEndpointAnchor{true};
     bool evaluateProfileForm{true};
     double anchorXPx{0.0};
@@ -70,6 +84,7 @@ struct DesignErrorSummary {
     ErrorStats absoluteFilteredStats;
     ErrorStats normalStats;
     ErrorStats profileStats;
+    DesignProfileMetadata designProfileMetadata;
 };
 
 struct DesignAlignmentResult {
@@ -77,14 +92,25 @@ struct DesignAlignmentResult {
     std::string message;
     DesignErrorSummary summary;
     std::vector<DesignErrorProfilePoint> profilePoints;
+    std::vector<DesignProfileSample> designProfileSamples;
     std::string profileCsvText;
     std::string summaryCsvText;
+    std::string error3dCsvText;
+    std::string compensationCsvText;
+    std::string featureCompensationCsvText;
 };
 
 DesignAlignmentResult compareMeasuredProfileToDesign(const std::vector<stitch::EdgeVariants>& edges,
                                                      const std::vector<cv::Mat>& imageTransforms,
                                                      const stitch::StitchPipelineConfig& config);
 
+DesignAlignmentResult compareMeasuredContourSamplesToDesign(const std::vector<cv::Point2d>& contourSamples,
+                                                            const stitch::StitchPipelineConfig& config);
+
+DesignAlignmentResult compareMeasuredCadProfileToDesign(const std::vector<DesignProfileSample>& measuredSamples,
+                                                        const stitch::StitchPipelineConfig& config);
+
 cv::Mat buildDesignComparisonPlot(const DesignAlignmentResult& result);
+cv::Mat buildCompensationPlot(const DesignAlignmentResult& result);
 
 } // namespace pinjie::cad_design

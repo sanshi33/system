@@ -52,6 +52,7 @@ add_compile_definitions(PINJIE_PROJECT_ROOT="${PINJIE_PROJECT_ROOT_CMAKE}")
 
 option(PINJIE_BUILD_GUI "Build the Qt Widgets GUI shell." ON)
 option(PINJIE_ENABLE_GALAXY_CAMERA "Build Galaxy SDK camera acquisition support." ON)
+option(PINJIE_ENABLE_OCCT_CAD_IMPORT "Enable OpenCascade CAD model import support." ON)
 set(_pinjie_default_galaxy_sdk_root "G:/GalaxySDK")
 if(NOT EXISTS "${_pinjie_default_galaxy_sdk_root}" AND EXISTS "E:/GalaxySDK")
     set(_pinjie_default_galaxy_sdk_root "E:/GalaxySDK")
@@ -68,6 +69,74 @@ endforeach()
 find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc imgcodecs calib3d features2d)
 find_package(Eigen3 CONFIG REQUIRED)
 find_package(Ceres CONFIG REQUIRED)
+
+set(PINJIE_OCCT_FOUND FALSE)
+set(PINJIE_OCCT_LIBRARIES "")
+set(PINJIE_OCCT_INCLUDE_DIRS "")
+if(PINJIE_ENABLE_OCCT_CAD_IMPORT)
+    find_package(OpenCASCADE CONFIG QUIET)
+    if(NOT OpenCASCADE_FOUND)
+        find_package(OpenCASCADE QUIET)
+    endif()
+    if(NOT OpenCASCADE_FOUND)
+        find_package(opencascade CONFIG QUIET)
+    endif()
+
+    if(OpenCASCADE_FOUND OR opencascade_FOUND)
+        if(DEFINED OpenCASCADE_LIBRARIES)
+            list(APPEND PINJIE_OCCT_LIBRARIES ${OpenCASCADE_LIBRARIES})
+        endif()
+        if(DEFINED opencascade_LIBRARIES)
+            list(APPEND PINJIE_OCCT_LIBRARIES ${opencascade_LIBRARIES})
+        endif()
+
+        foreach(_pinjie_occt_target IN ITEMS
+                OpenCASCADE::TKernel
+                OpenCASCADE::TKMath
+                OpenCASCADE::TKG2d
+                OpenCASCADE::TKG3d
+                OpenCASCADE::TKGeomBase
+                OpenCASCADE::TKBRep
+                OpenCASCADE::TKTopAlgo
+                OpenCASCADE::TKBO
+                OpenCASCADE::TKMesh
+                OpenCASCADE::TKXSBase
+                OpenCASCADE::TKSTEPBase
+                OpenCASCADE::TKSTEPAttr
+                OpenCASCADE::TKSTEP209
+                OpenCASCADE::TKSTEP
+                OpenCASCADE::TKIGES)
+            if(TARGET ${_pinjie_occt_target})
+                list(APPEND PINJIE_OCCT_LIBRARIES ${_pinjie_occt_target})
+            endif()
+        endforeach()
+
+        if(DEFINED OpenCASCADE_INCLUDE_DIRS)
+            list(APPEND PINJIE_OCCT_INCLUDE_DIRS ${OpenCASCADE_INCLUDE_DIRS})
+        endif()
+        if(DEFINED OpenCASCADE_INCLUDE_DIR)
+            list(APPEND PINJIE_OCCT_INCLUDE_DIRS ${OpenCASCADE_INCLUDE_DIR})
+        endif()
+        if(DEFINED opencascade_INCLUDE_DIRS)
+            list(APPEND PINJIE_OCCT_INCLUDE_DIRS ${opencascade_INCLUDE_DIRS})
+        endif()
+        if(DEFINED opencascade_INCLUDE_DIR)
+            list(APPEND PINJIE_OCCT_INCLUDE_DIRS ${opencascade_INCLUDE_DIR})
+        endif()
+
+        list(REMOVE_DUPLICATES PINJIE_OCCT_LIBRARIES)
+        list(REMOVE_DUPLICATES PINJIE_OCCT_INCLUDE_DIRS)
+
+        if(PINJIE_OCCT_LIBRARIES)
+            set(PINJIE_OCCT_FOUND TRUE)
+            message(STATUS "OpenCascade CAD import support enabled.")
+        else()
+            message(WARNING "OpenCascade package was found, but no link libraries were exposed. CAD import will be compiled in disabled mode.")
+        endif()
+    else()
+        message(WARNING "OpenCascade was not found. CAD import UI will stay available, but STEP/IGES loading is disabled in this build.")
+    endif()
+endif()
 
 set(PINJIE_GALAXY_CAMERA_TARGET "")
 if(PINJIE_ENABLE_GALAXY_CAMERA)
@@ -151,8 +220,10 @@ if(PINJIE_ENABLE_GALAXY_CAMERA)
 endif()
 
 set(STITCH_CORE_SOURCES
+    cad_model/CadModelLoader.cpp
     cad_design/DesignProfileAlignment.cpp
     cad_design/DesignProfileFunction.cpp
+    cad_design/LocalSlotAnalysis.cpp
     core/SubpixelEdgeDetector.cpp
     stitch/Alignment.cpp
     stitch/Blending.cpp
@@ -186,6 +257,15 @@ target_link_libraries(stitch_core
         opencv_imgcodecs
         opencv_imgproc
 )
+if(PINJIE_OCCT_FOUND)
+    target_link_libraries(stitch_core PUBLIC ${PINJIE_OCCT_LIBRARIES})
+    if(PINJIE_OCCT_INCLUDE_DIRS)
+        target_include_directories(stitch_core PUBLIC ${PINJIE_OCCT_INCLUDE_DIRS})
+    endif()
+    target_compile_definitions(stitch_core PUBLIC PINJIE_HAS_OCCT=1)
+else()
+    target_compile_definitions(stitch_core PUBLIC PINJIE_HAS_OCCT=0)
+endif()
 
 add_executable(stitch_app main_clean.cpp)
 target_compile_features(stitch_app PRIVATE cxx_std_17)
@@ -256,6 +336,46 @@ if(WIN32)
     )
 endif()
 
+add_executable(cad_model_probe tools/cad_model_probe.cpp)
+target_compile_features(cad_model_probe PRIVATE cxx_std_17)
+target_link_libraries(cad_model_probe PRIVATE stitch_core)
+
+if(MSVC)
+    target_compile_options(cad_model_probe PRIVATE /utf-8 /permissive- /W4)
+    target_compile_definitions(cad_model_probe PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+else()
+    target_compile_options(cad_model_probe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(WIN32)
+    add_custom_command(TARGET cad_model_probe POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:cad_model_probe>
+            $<TARGET_FILE_DIR:cad_model_probe>
+        COMMAND_EXPAND_LISTS
+    )
+endif()
+
+add_executable(design_reval_from_contour tools/design_reval_from_contour.cpp)
+target_compile_features(design_reval_from_contour PRIVATE cxx_std_17)
+target_link_libraries(design_reval_from_contour PRIVATE stitch_core)
+
+if(MSVC)
+    target_compile_options(design_reval_from_contour PRIVATE /utf-8 /permissive- /W4)
+    target_compile_definitions(design_reval_from_contour PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+else()
+    target_compile_options(design_reval_from_contour PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(WIN32)
+    add_custom_command(TARGET design_reval_from_contour POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:design_reval_from_contour>
+            $<TARGET_FILE_DIR:design_reval_from_contour>
+        COMMAND_EXPAND_LISTS
+    )
+endif()
+
 add_executable(standard_sphere_loop_eval
     standard_sphere_loop/main.cpp
     standard_sphere_loop/StandardSphereLoopExperiment.cpp
@@ -293,8 +413,12 @@ if(PINJIE_BUILD_GUI)
         gui/CalibrationWorker.cpp
         gui/CameraCaptureWorker.h
         gui/CameraCaptureWorker.cpp
+        gui/DesignModelPanel.h
+        gui/DesignModelPanel.cpp
         gui/ImageViewer.h
         gui/ImageViewer.cpp
+        gui/PointCloud3DViewer.h
+        gui/PointCloud3DViewer.cpp
         gui/StepTableModel.h
         gui/StepTableModel.cpp
         gui/StepDetailPanel.h

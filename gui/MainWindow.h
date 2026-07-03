@@ -1,9 +1,11 @@
 #pragma once
 
 #include "calibration/CalibrationTypes.h"
+#include "cad_model/CadModelLoader.h"
 #include "cad_design/DesignProfileAlignment.h"
 #include "gui/CalibrationConfigPanel.h"
 #include "gui/CalibrationWorker.h"
+#include "gui/DesignModelPanel.h"
 #include "gui/ImageViewer.h"
 #include "gui/RunConfigPanel.h"
 #include "gui/StepDetailPanel.h"
@@ -12,6 +14,7 @@
 
 #include <QHash>
 #include <QMainWindow>
+#include <QSize>
 #include <QStringList>
 
 #include <vector>
@@ -34,6 +37,8 @@ struct QualitySummary;
 
 namespace pinjie::gui {
 
+class PointCloud3DViewer;
+
 class MainWindow : public QMainWindow {
 public:
     explicit MainWindow(QWidget* parent = nullptr);
@@ -41,6 +46,8 @@ public:
 
 private:
     void startCalibration();
+    void startDesignModelImport();
+    void startScannedStlComparison(const QString& stlFilePath);
     void startRun();
     void startRun(pinjie::StitchRunMode runMode);
     void startCurrentModuleRun();
@@ -71,6 +78,9 @@ private:
     void switchToStage(int stageIndex);
     void refreshStageSummaries();
     bool hasActiveCalibration() const;
+    bool hasTemporaryDesignPixelSize() const;
+    bool hasLocalSlotImageMode() const;
+    bool hasMeasurementBaseline() const;
     void updateStageButtonStates(int stageIndex);
     void updateWorkflowAccessState();
     void updateModuleRunButtonText(int stageIndex);
@@ -89,10 +99,26 @@ private:
     void generatePublicationFigure();
     void refreshPublicationFigurePreview();
     void refreshReportExportState(const QString& statusMessage = QString());
+    void applyActiveDesignModelToRequest(pinjie::StitchRunRequest& request) const;
     void refreshCalibrationDetailPane();
+    void refreshDesignModelDetailPane();
+    bool generateCadModelPreview(const pinjie::cad_model::CadModelDocument& document);
+    QString buildInitialTable9AcceptanceText() const;
+    QString buildTable9AcceptanceText(bool ok,
+                                      int loadedImageCount,
+                                      int preprocessedImageCount,
+                                      const pinjie::cad_design::DesignAlignmentResult* designResult,
+                                      const pinjie::cad_design::DesignErrorSummary* designSummary) const;
+    QSize preferredPlotSize(const QWidget* widget, int minWidth, int minHeight) const;
+    bool generateMatplotlibDesignPlots(const pinjie::StitchRunRequest& request,
+                                       bool includeContourPreview,
+                                       QString& errorMessage,
+                                       QString* scriptOutput = nullptr) const;
+    void setAcceptanceText(const QString& text);
     void applyWindowStyle();
 
     CalibrationConfigPanel* calibrationPanel_{nullptr};
+    DesignModelPanel* designModelPanel_{nullptr};
     RunConfigPanel* configPanel_{nullptr};
     QStackedWidget* stageStack_{nullptr};
     QListWidget* processingImageList_{nullptr};
@@ -100,6 +126,8 @@ private:
     QTableView* stepTable_{nullptr};
     StepDetailPanel* stepDetailPanel_{nullptr};
     ImageViewer* calibrationPreviewViewer_{nullptr};
+    ImageViewer* cadPreviewViewer_{nullptr};
+    PointCloud3DViewer* cadInteractiveViewer_{nullptr};
     ImageViewer* acquisitionPreviewViewer_{nullptr};
     ImageViewer* processingPreviewViewer_{nullptr};
     ImageViewer* referenceViewer_{nullptr};
@@ -107,12 +135,17 @@ private:
     ImageViewer* debugViewer_{nullptr};
     ImageViewer* panoramaViewer_{nullptr};
     ImageViewer* designCompareViewer_{nullptr};
+    ImageViewer* singleSlotViewer_{nullptr};
+    PointCloud3DViewer* pointCloudViewer_{nullptr};
+    ImageViewer* compensationViewer_{nullptr};
     ImageViewer* publicationFigureViewer_{nullptr};
     QTabWidget* viewTabs_{nullptr};
     QTabWidget* reportViewTabs_{nullptr};
     QTabWidget* bottomTabs_{nullptr};
     QPlainTextEdit* calibrationOverviewEdit_{nullptr};
     QPlainTextEdit* calibrationDetailEdit_{nullptr};
+    QPlainTextEdit* designModelOverviewEdit_{nullptr};
+    QPlainTextEdit* designModelDetailEdit_{nullptr};
     QPlainTextEdit* acquisitionOverviewEdit_{nullptr};
     QPlainTextEdit* acquisitionPreviewInfoEdit_{nullptr};
     QPlainTextEdit* processingOverviewEdit_{nullptr};
@@ -122,6 +155,9 @@ private:
     QPlainTextEdit* qualityReviewEdit_{nullptr};
     QPlainTextEdit* designCompareEdit_{nullptr};
     QPlainTextEdit* candidateDiagnosticsEdit_{nullptr};
+    QPlainTextEdit* acceptanceChecklistEdit_{nullptr};
+    QPlainTextEdit* acceptanceOverviewEdit_{nullptr};
+    QPlainTextEdit* compensationSummaryEdit_{nullptr};
     QPlainTextEdit* csvEdit_{nullptr};
     QPlainTextEdit* logEdit_{nullptr};
     QLabel* workflowStateLabel_{nullptr};
@@ -155,9 +191,12 @@ private:
 
     std::vector<QPushButton*> moduleButtons_;
     QStringList lastImagePaths_;
+    QString lastCadPreviewImagePath_;
     QHash<int, QImage> preprocessImages_;
     QHash<int, QImage> debugImages_;
     pinjie::CameraCalibrationRequest lastCalibrationRequest_{};
+    pinjie::cad_model::DesignModelRequest lastDesignModelRequest_{};
+    pinjie::cad_model::CadModelDocument activeCadModelDocument_{};
     pinjie::CalibrationResultCache activeCalibrationCache_{};
     pinjie::StitchRunRequest lastRequest_{};
     pinjie::StitchRunCachePtr runCache_{};

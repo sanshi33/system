@@ -75,20 +75,20 @@ DesignEval evalDesignRadiusOriginal(const double zMm)
     return eval;
 }
 
-DesignEval evalDesignRadiusCompare(const double sMm, const bool reverseZ)
+DesignEval evalDesignRadiusCompare(const double sMm, const bool reverseAxial)
 {
     if (!std::isfinite(sMm)) {
         return {};
     }
 
-    const double zOriginal = reverseZ ? (kDesignProfileMaxZMm - sMm) : sMm;
+    const double zOriginal = reverseAxial ? (kDesignProfileMaxZMm - sMm) : sMm;
     DesignEval eval = evalDesignRadiusOriginal(zOriginal);
     if (!eval.valid) {
         return eval;
     }
 
     eval.z_mm = sMm;
-    if (reverseZ) {
+    if (reverseAxial) {
         eval.dr_dz = -eval.dr_dz;
     }
     return eval;

@@ -45,6 +45,7 @@ TransformResult matchOnePair(const EdgeVariants& prev_edges,
 
 void populateAlignmentMetrics(const std::vector<cv::Point2d>& ref_edges,
                               const std::vector<cv::Point2d>& rotated_target_edges,
-                              TransformResult& res);
+                              TransformResult& res,
+                              bool use_unfolded_tangent_correlation = true);
 
 } // namespace stitch

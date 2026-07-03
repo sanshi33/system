@@ -21,6 +21,6 @@ double evalDesignRadiusDerivative(double zMm);
 
 DesignEval evalDesignRadiusOriginal(double zMm);
 
-DesignEval evalDesignRadiusCompare(double sMm, bool reverseZ);
+DesignEval evalDesignRadiusCompare(double sMm, bool reverseAxial);
 
 } // namespace pinjie::cad_design

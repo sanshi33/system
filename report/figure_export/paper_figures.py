@@ -572,8 +572,8 @@ def fig_summary_table(data: RunData, fig_dir: Path, width_mm: float) -> None:
 
     s_min = float(data.used_df["s_aligned_mm"].min())
     s_max = float(data.used_df["s_aligned_mm"].max())
-    reverse_z_flag = _to_float("design_reverse_z", 0.0)
-    reverse_z_text = "yes" if reverse_z_flag and int(reverse_z_flag) else "no"
+    reverse_axial_flag = _to_float("design_reverse_axial", _to_float("design_reverse_z", 0.0))
+    reverse_axial_text = "yes" if reverse_axial_flag and int(reverse_axial_flag) else "no"
     used_count = _to_float("used_count", float(len(data.used_df)))
     motion_diag = None
     if data.stitching_df is not None and not data.stitching_df.empty:
@@ -587,7 +587,7 @@ def fig_summary_table(data: RunData, fig_dir: Path, width_mm: float) -> None:
     rows = [
         ("Sample", "Used points", str(int(used_count))),
         ("", "Pixel size", f"{_s('pixel_size_mm', 4)} mm/px"),
-        ("", "Reverse Z", reverse_z_text),
+        ("", "Reverse axial", reverse_axial_text),
         ("", "s range", f"{s_min:.1f} to {s_max:.1f} mm"),
         ("Normal", "Mean bias", rf"{_s('mean_normal_error_um')} $\mu$m"),
         ("", "RMSE", rf"{_s('normal_rmse_um')} $\mu$m"),

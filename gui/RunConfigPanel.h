@@ -59,6 +59,7 @@ signals:
 private:
     QStringList scanImagePaths() const;
     void updateDetectedCount();
+    void updateInputImagePreview();
     pinjie::MotionPriorDirection currentDirection() const;
     void connectChangeSignals();
     bool buildCameraRequest(pinjie::CameraSequenceRequest& request,

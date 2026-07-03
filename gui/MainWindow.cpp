@@ -2,6 +2,7 @@
 
 #include "common/ResultPathUtils.h"
 #include "gui/QtImageUtils.h"
+#include "gui/PointCloud3DViewer.h"
 #include "report/QualitySummaryBuilder.h"
 #include "stitch/DebugVis.h"
 #include "stitch/IO.h"
@@ -35,9 +36,11 @@
 #include <QWidget>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 
 namespace pinjie::gui {
 
@@ -48,7 +51,8 @@ enum WorkflowStageIndex {
     AcquisitionStage = 1,
     ProcessingStage = 2,
     RegistrationStage = 3,
-    ReportStage = 4
+    ReportStage = 4,
+    CompensationStage = 5
 };
 
 constexpr int kStageSidebarMinimumWidth = 260;
@@ -69,10 +73,38 @@ constexpr int kBottomCoverageTabIndex = 1;
 constexpr int kBottomPointDetailTabIndex = 2;
 constexpr int kBottomDiagnosticTabIndex = 3;
 constexpr int kBottomCsvTabIndex = 4;
+constexpr int kBottomAcceptanceTabIndex = 5;
 
 bool isStandardCircleMode(const pinjie::StitchRunRequest& request)
 {
     return request.standardCircleConfig.enabled;
+}
+
+constexpr double kLegacySingleProfileSyntheticPixelSizeMm = 0.05;
+constexpr double kCadSectionSingleSlotPixelSizeMm = 0.0476190476;
+
+double singleSlotTestPixelSizeMm(const pinjie::StitchRunRequest& request)
+{
+    for (const std::string& imagePath : request.imagePaths) {
+        std::string lowerPath = imagePath;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (lowerPath.find("profile_2040_cad_section_input") != std::string::npos ||
+            lowerPath.find("profile_2040_cad_section") != std::string::npos) {
+            return kCadSectionSingleSlotPixelSizeMm;
+        }
+        if (lowerPath.find("single_profile_synthetic") != std::string::npos ||
+            lowerPath.find("profile_2040_single") != std::string::npos) {
+            return kLegacySingleProfileSyntheticPixelSizeMm;
+        }
+    }
+    return 0.0;
+}
+
+bool isSingleSlotTestInput(const pinjie::StitchRunRequest& request)
+{
+    return singleSlotTestPixelSizeMm(request) > 0.0;
 }
 
 QString metricKey(const QString& metric, const QString& unit)
@@ -123,6 +155,36 @@ QString metricValue(const QHash<QString, QString>& metrics,
     return metrics.value(metricKey(metric, unit));
 }
 
+QString cleanCsvCell(QString value)
+{
+    value = value.trimmed();
+    if (value.size() >= 2 && value.startsWith('"') && value.endsWith('"')) {
+        value = value.mid(1, value.size() - 2);
+        value.replace(QStringLiteral("\"\""), QStringLiteral("\""));
+    }
+    return value;
+}
+
+QHash<QString, QString> parseFirstCsvDataRow(const QString& csvText)
+{
+    QHash<QString, QString> values;
+    const QStringList lines = csvText.split(QRegularExpression(QStringLiteral("[\r\n]+")),
+                                            Qt::SkipEmptyParts);
+    if (lines.size() < 2) {
+        return values;
+    }
+    const QStringList headers = lines.at(0).split(',');
+    const QStringList cells = lines.at(1).split(',');
+    const int count = std::min(headers.size(), cells.size());
+    for (int index = 0; index < count; ++index) {
+        const QString key = cleanCsvCell(headers.at(index));
+        if (!key.isEmpty()) {
+            values.insert(key, cleanCsvCell(cells.at(index)));
+        }
+    }
+    return values;
+}
+
 void setReportTabTexts(QTabWidget* reportTabs, QTabWidget* bottomTabs, const bool standardCircleMode)
 {
     if (reportTabs) {
@@ -130,23 +192,26 @@ void setReportTabTexts(QTabWidget* reportTabs, QTabWidget* bottomTabs, const boo
                                standardCircleMode ? QStringLiteral("测量窗口图")
                                                   : QStringLiteral("全景结果"));
         reportTabs->setTabText(kReportSecondaryImageTabIndex,
-                               standardCircleMode ? QStringLiteral("边缘叠加图")
-                                                  : QStringLiteral("设计比对图"));
+                                standardCircleMode ? QStringLiteral("边缘叠加图")
+                                                   : QStringLiteral("误差分析图"));
     }
     if (bottomTabs) {
-        bottomTabs->setTabText(kBottomSummaryTabIndex, QStringLiteral("摘要"));
+        bottomTabs->setTabText(kBottomSummaryTabIndex, QStringLiteral("复检总览"));
         bottomTabs->setTabText(kBottomCoverageTabIndex,
                                standardCircleMode ? QStringLiteral("候选覆盖")
                                                   : QStringLiteral("质量审查"));
         bottomTabs->setTabText(kBottomPointDetailTabIndex,
                                standardCircleMode ? QStringLiteral("25点详情")
-                                                  : QStringLiteral("设计比对"));
+                                                  : QStringLiteral("CAD比对"));
         bottomTabs->setTabText(kBottomDiagnosticTabIndex,
                                standardCircleMode ? QStringLiteral("掩模诊断")
                                                   : QStringLiteral("候选诊断"));
         bottomTabs->setTabText(kBottomCsvTabIndex,
                                standardCircleMode ? QStringLiteral("摘要 CSV")
                                                   : QStringLiteral("CSV 数据"));
+        bottomTabs->setTabText(kBottomAcceptanceTabIndex,
+                               standardCircleMode ? QStringLiteral("国标复检清单")
+                                                  : QStringLiteral("表9验收对照"));
     }
 }
 
@@ -188,16 +253,18 @@ QString stageTitle(int stageIndex)
 {
     switch (stageIndex) {
     case CalibrationStage:
-        return QStringLiteral("标定");
+        return QStringLiteral("CAD/目标尺寸");
     case AcquisitionStage:
-        return QStringLiteral("图像加载");
+        return QStringLiteral("数据接收预处理");
     case ProcessingStage:
-        return QStringLiteral("轮廓预处理");
+        return QStringLiteral("特征提取");
     case RegistrationStage:
-        return QStringLiteral("拼接配准");
+        return QStringLiteral("模型配准");
     case ReportStage:
+        return QStringLiteral("误差分析");
+    case CompensationStage:
     default:
-        return QStringLiteral("结果导出");
+        return QStringLiteral("补偿解算");
     }
 }
 
@@ -205,13 +272,13 @@ QString runModeLabel(const pinjie::StitchRunMode runMode)
 {
     switch (runMode) {
     case pinjie::StitchRunMode::Acquisition:
-        return QStringLiteral("图像加载");
+        return QStringLiteral("数据接收预处理");
     case pinjie::StitchRunMode::Processing:
-        return QStringLiteral("轮廓预处理");
+        return QStringLiteral("特征提取");
     case pinjie::StitchRunMode::Registration:
-        return QStringLiteral("拼接配准");
+        return QStringLiteral("模型配准");
     case pinjie::StitchRunMode::Report:
-        return QStringLiteral("结果导出");
+        return QStringLiteral("误差分析");
     case pinjie::StitchRunMode::Full:
     default:
         return QStringLiteral("全流程");
@@ -229,6 +296,7 @@ pinjie::StitchRunMode runModeForStageIndex(int stageIndex)
     case RegistrationStage:
         return pinjie::StitchRunMode::Registration;
     case ReportStage:
+    case CompensationStage:
     default:
         return pinjie::StitchRunMode::Report;
     }
@@ -301,6 +369,52 @@ bool sameEdgeConfig(const stitch::EdgeDetectConfig& lhs, const stitch::EdgeDetec
            nearlyEqual(lhs.filterHampelMinScale, rhs.filterHampelMinScale);
 }
 
+bool sameDesignProfileMetadata(const pinjie::cad_design::DesignProfileMetadata& lhs,
+                               const pinjie::cad_design::DesignProfileMetadata& rhs)
+{
+    return lhs.sourceType == rhs.sourceType &&
+           lhs.sourceName == rhs.sourceName &&
+           lhs.sourcePath == rhs.sourcePath &&
+           lhs.extractionMethod == rhs.extractionMethod &&
+           lhs.axialAxis == rhs.axialAxis &&
+           lhs.radialAxis == rhs.radialAxis &&
+           lhs.sectionNormalAxis == rhs.sectionNormalAxis &&
+           nearlyEqual(lhs.sectionCoordinateMm, rhs.sectionCoordinateMm) &&
+           nearlyEqual(lhs.cadAxialOriginMm, rhs.cadAxialOriginMm) &&
+           nearlyEqual(lhs.cadAxialDirectionSign, rhs.cadAxialDirectionSign) &&
+           lhs.sampleCount == rhs.sampleCount &&
+           nearlyEqual(lhs.minSMm, rhs.minSMm) &&
+           nearlyEqual(lhs.maxSMm, rhs.maxSMm) &&
+           nearlyEqual(lhs.minRMm, rhs.minRMm) &&
+           nearlyEqual(lhs.maxRMm, rhs.maxRMm) &&
+           lhs.hasCadBounds == rhs.hasCadBounds &&
+           nearlyEqual(lhs.minCadXMm, rhs.minCadXMm) &&
+           nearlyEqual(lhs.minCadYMm, rhs.minCadYMm) &&
+           nearlyEqual(lhs.minCadZMm, rhs.minCadZMm) &&
+           nearlyEqual(lhs.maxCadXMm, rhs.maxCadXMm) &&
+           nearlyEqual(lhs.maxCadYMm, rhs.maxCadYMm) &&
+           nearlyEqual(lhs.maxCadZMm, rhs.maxCadZMm);
+}
+
+bool sameDesignProfileSamples(const std::vector<pinjie::cad_design::DesignProfileSample>& lhs,
+                              const std::vector<pinjie::cad_design::DesignProfileSample>& rhs)
+{
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!nearlyEqual(lhs[i].sMm, rhs[i].sMm) ||
+            !nearlyEqual(lhs[i].rMm, rhs[i].rMm) ||
+            lhs[i].hasCadPoint != rhs[i].hasCadPoint ||
+            !nearlyEqual(lhs[i].cadXMm, rhs[i].cadXMm) ||
+            !nearlyEqual(lhs[i].cadYMm, rhs[i].cadYMm) ||
+            !nearlyEqual(lhs[i].cadZMm, rhs[i].cadZMm)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool samePipelineConfig(const stitch::StitchPipelineConfig& lhs, const stitch::StitchPipelineConfig& rhs)
 {
     return nearlyEqual(lhs.expectedOverlapRatio, rhs.expectedOverlapRatio) &&
@@ -315,7 +429,7 @@ bool samePipelineConfig(const stitch::StitchPipelineConfig& lhs, const stitch::S
            lhs.generateDebugVisualization == rhs.generateDebugVisualization &&
            lhs.enableDesignComparison == rhs.enableDesignComparison &&
            lhs.designEvaluateProfileForm == rhs.designEvaluateProfileForm &&
-           lhs.designReverseZ == rhs.designReverseZ &&
+           lhs.designReverseAxial == rhs.designReverseAxial &&
            lhs.designUseLeftEndpointAnchor == rhs.designUseLeftEndpointAnchor &&
            lhs.designAnchorRadialToLeftEndpoint == rhs.designAnchorRadialToLeftEndpoint &&
            lhs.designEnableBestFitTranslation == rhs.designEnableBestFitTranslation &&
@@ -328,11 +442,26 @@ bool samePipelineConfig(const stitch::StitchPipelineConfig& lhs, const stitch::S
            lhs.designInvertY == rhs.designInvertY &&
            lhs.designUseUpperEnvelope == rhs.designUseUpperEnvelope &&
            nearlyEqual(lhs.designProfileBinWidthPx, rhs.designProfileBinWidthPx) &&
-           lhs.designFilterEndFaceEdges == rhs.designFilterEndFaceEdges &&
-           nearlyEqual(lhs.designMaxAbsSlopeForGeneratrix, rhs.designMaxAbsSlopeForGeneratrix) &&
-           lhs.designSlopeWindow == rhs.designSlopeWindow &&
-           nearlyEqual(lhs.designTrimLeftAfterEndpointMm, rhs.designTrimLeftAfterEndpointMm) &&
-           nearlyEqual(lhs.designTrimRightMm, rhs.designTrimRightMm);
+            lhs.designFilterEndFaceEdges == rhs.designFilterEndFaceEdges &&
+            nearlyEqual(lhs.designMaxAbsSlopeForGeneratrix, rhs.designMaxAbsSlopeForGeneratrix) &&
+            lhs.designSlopeWindow == rhs.designSlopeWindow &&
+            nearlyEqual(lhs.designTrimLeftAfterEndpointMm, rhs.designTrimLeftAfterEndpointMm) &&
+            nearlyEqual(lhs.designTrimRightMm, rhs.designTrimRightMm) &&
+            lhs.designUseExternalProfile == rhs.designUseExternalProfile &&
+            nearlyEqual(lhs.designTargetSlotWidthMm, rhs.designTargetSlotWidthMm) &&
+            nearlyEqual(lhs.designTargetSlotDepthMm, rhs.designTargetSlotDepthMm) &&
+            lhs.localSlotImageMode == rhs.localSlotImageMode &&
+            nearlyEqual(lhs.localSlotBottomWidthMm, rhs.localSlotBottomWidthMm) &&
+            nearlyEqual(lhs.localSlotPixelSizeOverrideMm, rhs.localSlotPixelSizeOverrideMm) &&
+            nearlyEqual(lhs.localSlotPixelSizeScale, rhs.localSlotPixelSizeScale) &&
+            lhs.localSlotMaxOutputPoints == rhs.localSlotMaxOutputPoints &&
+            lhs.designUseCentralSlotImageRoi == rhs.designUseCentralSlotImageRoi &&
+            nearlyEqual(lhs.designImageRoiXRatio, rhs.designImageRoiXRatio) &&
+            nearlyEqual(lhs.designImageRoiYRatio, rhs.designImageRoiYRatio) &&
+            nearlyEqual(lhs.designImageRoiWidthRatio, rhs.designImageRoiWidthRatio) &&
+            nearlyEqual(lhs.designImageRoiHeightRatio, rhs.designImageRoiHeightRatio) &&
+            sameDesignProfileMetadata(lhs.designProfileMetadata, rhs.designProfileMetadata) &&
+            sameDesignProfileSamples(lhs.designExternalProfileSamples, rhs.designExternalProfileSamples);
 }
 
 bool canReuseOutputPaths(const pinjie::StitchRunRequest& previousRequest,
@@ -354,7 +483,11 @@ void copyOutputPaths(const pinjie::StitchRunRequest& source, pinjie::StitchRunRe
     target.csvOutputPath = source.csvOutputPath;
     target.designErrorProfileCsvOutputPath = source.designErrorProfileCsvOutputPath;
     target.designErrorSummaryCsvOutputPath = source.designErrorSummaryCsvOutputPath;
+    target.design3dErrorCsvOutputPath = source.design3dErrorCsvOutputPath;
+    target.designCompensationCsvOutputPath = source.designCompensationCsvOutputPath;
+    target.designFeatureCompensationCsvOutputPath = source.designFeatureCompensationCsvOutputPath;
     target.designComparisonOverlayOutputPath = source.designComparisonOverlayOutputPath;
+    target.designCompensationPlotOutputPath = source.designCompensationPlotOutputPath;
     target.qualityReviewCsvOutputPath = source.qualityReviewCsvOutputPath;
     target.alignmentCandidateDiagnosticsCsvOutputPath = source.alignmentCandidateDiagnosticsCsvOutputPath;
     target.contourPointsCsvOutputPath = source.contourPointsCsvOutputPath;
@@ -410,6 +543,16 @@ QString publicationFigurePngPath(const pinjie::StitchRunRequest& request)
     }
     const std::filesystem::path path =
         std::filesystem::u8path(request.resultOutputDir) / "journal_figure.png";
+    return QDir::toNativeSeparators(QString::fromStdString(path.u8string()));
+}
+
+QString designPointCloudPngPath(const pinjie::StitchRunRequest& request)
+{
+    if (request.resultOutputDir.empty()) {
+        return {};
+    }
+    const std::filesystem::path path =
+        std::filesystem::u8path(request.resultOutputDir) / "design_3d_point_cloud.png";
     return QDir::toNativeSeparators(QString::fromStdString(path.u8string()));
 }
 
@@ -517,6 +660,27 @@ QString calibrationQualityLine(const pinjie::CalibrationResultCache& cache)
     return parts.join(QStringLiteral(" | "));
 }
 
+double calibrationPixelSizeMm(const pinjie::CalibrationResultCache& cache)
+{
+    if (!cache.valid || !cache.profile.valid) {
+        return 0.0;
+    }
+
+    const auto& quality = cache.profile.quality;
+    std::vector<double> pixelSizes;
+    if (quality.fxPixelsPerMm > 0.0) {
+        pixelSizes.push_back(1.0 / quality.fxPixelsPerMm);
+    }
+    if (quality.fyPixelsPerMm > 0.0) {
+        pixelSizes.push_back(1.0 / quality.fyPixelsPerMm);
+    }
+    if (pixelSizes.empty()) {
+        return 0.0;
+    }
+    return std::accumulate(pixelSizes.begin(), pixelSizes.end(), 0.0) /
+           static_cast<double>(pixelSizes.size());
+}
+
 QString calibrationIdentityLine(const pinjie::CalibrationResultCache& cache)
 {
     if (!cache.valid) {
@@ -581,10 +745,11 @@ MainWindow::MainWindow(QWidget* parent)
     qRegisterMetaType<pinjie::StitchStepRecord>("pinjie::StitchStepRecord");
     qRegisterMetaType<pinjie::StitchRunCachePtr>("pinjie::StitchRunCachePtr");
 
-    setWindowTitle(QStringLiteral("远心轮廓拼接工作台"));
+    setWindowTitle(QStringLiteral("在线测量与误差补偿系统"));
     resize(1360, 760);
 
     calibrationPanel_ = new CalibrationConfigPanel(this);
+    designModelPanel_ = new DesignModelPanel(this);
     configPanel_ = new RunConfigPanel(this);
 
     auto* central = new QWidget(this);
@@ -593,12 +758,12 @@ MainWindow::MainWindow(QWidget* parent)
     rootLayout->setContentsMargins(3, 3, 3, 3);
     rootLayout->setSpacing(3);
 
-    auto* titleLabel = new QLabel(QStringLiteral("远心轮廓拼接工作台"), central);
+    auto* titleLabel = new QLabel(QStringLiteral("在线测量与误差补偿系统"), central);
     titleLabel->setObjectName(QStringLiteral("pageTitleLabel"));
 
-    startButton_ = new QPushButton(QStringLiteral("运行全流程"), central);
+    startButton_ = new QPushButton(QStringLiteral("运行复检全流程"), central);
     startButton_->setObjectName(QStringLiteral("primaryActionButton"));
-    moduleRunButton_ = new QPushButton(QStringLiteral("运行当前阶段"), central);
+    moduleRunButton_ = new QPushButton(QStringLiteral("运行当前模块"), central);
     moduleRunButton_->setObjectName(QStringLiteral("secondaryActionButton"));
     stopButton_ = new QPushButton(QStringLiteral("停止任务"), central);
     stopButton_->setObjectName(QStringLiteral("dangerActionButton"));
@@ -648,16 +813,18 @@ MainWindow::MainWindow(QWidget* parent)
 
     auto* moduleRow = new QHBoxLayout();
     moduleRow->setSpacing(10);
-    const QStringList moduleLabels = {QStringLiteral("1 标定"),
-                                      QStringLiteral("2 输入图像"),
-                                      QStringLiteral("3 轮廓预处理"),
-                                      QStringLiteral("4 配准诊断"),
-                                      QStringLiteral("5 导出结果")};
-    const QStringList moduleStages = {QStringLiteral("calibration"),
+    const QStringList moduleLabels = {QStringLiteral("1 CAD/目标尺寸"),
+                                      QStringLiteral("2 数据接收预处理"),
+                                      QStringLiteral("3 特征提取"),
+                                      QStringLiteral("4 模型配准"),
+                                      QStringLiteral("5 误差分析"),
+                                      QStringLiteral("6 补偿解算")};
+    const QStringList moduleStages = {QStringLiteral("baseline"),
                                       QStringLiteral("acquisition"),
                                       QStringLiteral("processing"),
                                       QStringLiteral("registration"),
-                                      QStringLiteral("report")};
+                                      QStringLiteral("analysis"),
+                                      QStringLiteral("compensation")};
     for (int i = 0; i < moduleLabels.size(); ++i) {
         auto* button = makeModuleButton(moduleLabels.at(i), central);
         button->setProperty("stage", moduleStages.at(i));
@@ -684,36 +851,59 @@ MainWindow::MainWindow(QWidget* parent)
     rootLayout->addWidget(stageStack_, 1);
 
     auto* calibrationPage = new QWidget(central);
-    calibrationPage->setObjectName(QStringLiteral("calibrationStagePage"));
+    calibrationPage->setObjectName(QStringLiteral("baselineStagePage"));
     calibrationOverviewEdit_ = makeReadOnlyTextEdit(calibrationPage);
+    calibrationOverviewEdit_->setMaximumHeight(kSidebarSummaryMaximumHeight);
+    designModelOverviewEdit_ = makeReadOnlyTextEdit(calibrationPage);
+    designModelOverviewEdit_->setMaximumHeight(kSidebarSummaryMaximumHeight);
     calibrationDetailEdit_ = makeReadOnlyTextEdit(calibrationPage);
     calibrationDetailEdit_->setMaximumHeight(kSidebarSummaryMaximumHeight);
+    designModelDetailEdit_ = makeReadOnlyTextEdit(calibrationPage);
     calibrationPreviewViewer_ = new ImageViewer(calibrationPage);
-    auto* calibrationSidebar = new QWidget(calibrationPage);
-    configureStageSidebar(calibrationSidebar);
-    auto* calibrationSidebarLayout = new QVBoxLayout(calibrationSidebar);
-    calibrationSidebarLayout->setContentsMargins(0, 0, 0, 0);
-    calibrationOverviewEdit_->setMaximumHeight(kSidebarSummaryMaximumHeight);
-    calibrationSidebarLayout->addWidget(makeScrollArea(calibrationPanel_, calibrationSidebar), 1);
-    calibrationSidebarLayout->addWidget(calibrationOverviewEdit_);
+    cadPreviewViewer_ = new ImageViewer(calibrationPage);
+    cadInteractiveViewer_ = new PointCloud3DViewer(calibrationPage);
 
-    auto* calibrationRightPane = new QWidget(calibrationPage);
-    auto* calibrationRightLayout = new QVBoxLayout(calibrationRightPane);
-    calibrationRightLayout->setContentsMargins(0, 0, 0, 0);
-    calibrationRightLayout->addWidget(calibrationPreviewViewer_, 1);
-    calibrationRightLayout->addWidget(calibrationDetailEdit_);
+    auto* baselineSidebar = new QWidget(calibrationPage);
+    configureStageSidebar(baselineSidebar);
+    auto* baselineSidebarLayout = new QVBoxLayout(baselineSidebar);
+    baselineSidebarLayout->setContentsMargins(0, 0, 0, 0);
+    auto* baselineConfigTabs = new QTabWidget(baselineSidebar);
+    baselineConfigTabs->addTab(makeScrollArea(calibrationPanel_, baselineConfigTabs), QStringLiteral("量值标定"));
+    baselineConfigTabs->addTab(makeScrollArea(designModelPanel_, baselineConfigTabs), QStringLiteral("CAD基准"));
+    baselineSidebarLayout->addWidget(baselineConfigTabs, 1);
+    baselineSidebarLayout->addWidget(calibrationOverviewEdit_);
+    baselineSidebarLayout->addWidget(designModelOverviewEdit_);
 
-    auto* calibrationSplit = new QSplitter(Qt::Horizontal, calibrationPage);
-    calibrationSplit->addWidget(calibrationSidebar);
-    calibrationSplit->addWidget(calibrationRightPane);
-    calibrationSplit->setStretchFactor(0, 0);
-    calibrationSplit->setStretchFactor(1, 1);
-    configureStageSplit(calibrationSplit);
+    auto* calibrationEvidencePane = new QWidget(calibrationPage);
+    auto* calibrationEvidenceLayout = new QVBoxLayout(calibrationEvidencePane);
+    calibrationEvidenceLayout->setContentsMargins(0, 0, 0, 0);
+    calibrationEvidenceLayout->addWidget(calibrationPreviewViewer_, 1);
+    calibrationEvidenceLayout->addWidget(calibrationDetailEdit_);
+
+    auto* designEvidencePane = new QWidget(calibrationPage);
+    auto* designEvidenceLayout = new QVBoxLayout(designEvidencePane);
+    designEvidenceLayout->setContentsMargins(0, 0, 0, 0);
+    auto* cadViewTabs = new QTabWidget(designEvidencePane);
+    cadViewTabs->addTab(cadPreviewViewer_, QStringLiteral("CAD截面静态图"));
+    cadViewTabs->addTab(cadInteractiveViewer_, QStringLiteral("CAD零件3D"));
+    designEvidenceLayout->addWidget(cadViewTabs, 3);
+    designEvidenceLayout->addWidget(designModelDetailEdit_, 2);
+
+    auto* baselineEvidenceTabs = new QTabWidget(calibrationPage);
+    baselineEvidenceTabs->addTab(calibrationEvidencePane, QStringLiteral("标定预览"));
+    baselineEvidenceTabs->addTab(designEvidencePane, QStringLiteral("CAD详情"));
+
+    auto* baselineSplit = new QSplitter(Qt::Horizontal, calibrationPage);
+    baselineSplit->addWidget(baselineSidebar);
+    baselineSplit->addWidget(baselineEvidenceTabs);
+    baselineSplit->setStretchFactor(0, 0);
+    baselineSplit->setStretchFactor(1, 1);
+    configureStageSplit(baselineSplit);
 
     auto* calibrationLayout = new QVBoxLayout(calibrationPage);
     calibrationLayout->setContentsMargins(0, 0, 0, 0);
     calibrationLayout->setSpacing(6);
-    calibrationLayout->addWidget(calibrationSplit, 1);
+    calibrationLayout->addWidget(baselineSplit, 1);
     stageStack_->addWidget(calibrationPage);
 
     auto* acquisitionPage = new QWidget(central);
@@ -722,7 +912,7 @@ MainWindow::MainWindow(QWidget* parent)
     acquisitionPreviewViewer_ = new ImageViewer(acquisitionPage);
     acquisitionPreviewInfoEdit_ = makeReadOnlyTextEdit(acquisitionPage);
     acquisitionPreviewInfoEdit_->setMaximumHeight(kSidebarSummaryMaximumHeight);
-    acquisitionPreviewInfoEdit_->setPlainText(QStringLiteral("等待采集预览。"));
+    acquisitionPreviewInfoEdit_->setPlainText(QStringLiteral("等待导入图像或相机采集预览。"));
     auto* acquisitionSidebar = new QWidget(acquisitionPage);
     configureStageSidebar(acquisitionSidebar);
     auto* acquisitionSidebarLayout = new QVBoxLayout(acquisitionSidebar);
@@ -881,27 +1071,33 @@ MainWindow::MainWindow(QWidget* parent)
     reportPage->setObjectName(QStringLiteral("reportStagePage"));
     panoramaViewer_ = new ImageViewer(reportPage);
     designCompareViewer_ = new ImageViewer(reportPage);
+    singleSlotViewer_ = new ImageViewer(reportPage);
+    pointCloudViewer_ = new PointCloud3DViewer(reportPage);
     publicationFigureViewer_ = new ImageViewer(reportPage);
     summaryEdit_ = makeReadOnlyTextEdit(reportPage);
     qualityReviewEdit_ = makeReadOnlyTextEdit(reportPage);
     designCompareEdit_ = makeReadOnlyTextEdit(reportPage);
     candidateDiagnosticsEdit_ = makeReadOnlyTextEdit(reportPage);
+    acceptanceChecklistEdit_ = makeReadOnlyTextEdit(reportPage);
     csvEdit_ = makeReadOnlyTextEdit(reportPage);
     logEdit_ = makeReadOnlyTextEdit(reportPage);
     reportViewTabs_ = new QTabWidget(reportPage);
     reportViewTabs_->setObjectName(QStringLiteral("reportViewTabs"));
     reportViewTabs_->setMinimumHeight(kReportViewerMinimumHeight);
     reportViewTabs_->addTab(panoramaViewer_, QStringLiteral("全景结果"));
-    reportViewTabs_->addTab(designCompareViewer_, QStringLiteral("设计比对图"));
-    reportViewTabs_->addTab(publicationFigureViewer_, QStringLiteral("误差分析图"));
+    reportViewTabs_->addTab(designCompareViewer_, QStringLiteral("误差分析图"));
+    reportViewTabs_->addTab(singleSlotViewer_, QStringLiteral("单槽放大图"));
+    reportViewTabs_->addTab(pointCloudViewer_, QStringLiteral("交互3D点云"));
+    reportViewTabs_->addTab(publicationFigureViewer_, QStringLiteral("出版误差图"));
     bottomTabs_ = new QTabWidget(reportPage);
     bottomTabs_->setObjectName(QStringLiteral("reportTabs"));
     bottomTabs_->setMinimumHeight(kReportDetailsMinimumHeight);
-    bottomTabs_->addTab(summaryEdit_, QStringLiteral("摘要"));
+    bottomTabs_->addTab(summaryEdit_, QStringLiteral("复检总览"));
     bottomTabs_->addTab(qualityReviewEdit_, QStringLiteral("质量审查"));
-    bottomTabs_->addTab(designCompareEdit_, QStringLiteral("设计比对"));
+    bottomTabs_->addTab(designCompareEdit_, QStringLiteral("CAD比对"));
     bottomTabs_->addTab(candidateDiagnosticsEdit_, QStringLiteral("候选诊断"));
     bottomTabs_->addTab(csvEdit_, QStringLiteral("CSV 数据"));
+    bottomTabs_->addTab(acceptanceChecklistEdit_, QStringLiteral("表9验收对照"));
     bottomTabs_->addTab(logEdit_, QStringLiteral("日志"));
     auto* metricRail = new QWidget(reportPage);
     metricRail->setObjectName(QStringLiteral("reportMetricRail"));
@@ -911,9 +1107,18 @@ MainWindow::MainWindow(QWidget* parent)
     metricRailLayout->setContentsMargins(8, 8, 8, 8);
     metricRailLayout->setSpacing(8);
 
-    auto* metricRailTitle = new QLabel(QStringLiteral("核心指标"), metricRail);
+    auto* metricRailTitle = new QLabel(QStringLiteral("复检指标"), metricRail);
     metricRailTitle->setObjectName(QStringLiteral("reportRailTitleLabel"));
     metricRailLayout->addWidget(metricRailTitle);
+
+    auto* acceptanceRailTitle = new QLabel(QStringLiteral("表9验收对照"), metricRail);
+    acceptanceRailTitle->setObjectName(QStringLiteral("reportRailTitleLabel"));
+    metricRailLayout->addWidget(acceptanceRailTitle);
+    acceptanceOverviewEdit_ = makeReadOnlyTextEdit(metricRail);
+    acceptanceOverviewEdit_->setObjectName(QStringLiteral("acceptanceOverviewEdit"));
+    acceptanceOverviewEdit_->setMaximumHeight(230);
+    acceptanceOverviewEdit_->setPlainText(QStringLiteral("等待运行。"));
+    metricRailLayout->addWidget(acceptanceOverviewEdit_);
 
     auto* metricGrid = new QGridLayout();
     metricGrid->setContentsMargins(0, 0, 0, 0);
@@ -968,7 +1173,7 @@ MainWindow::MainWindow(QWidget* parent)
     reportMetricPaneButton->setText(QStringLiteral("指标"));
     reportMetricPaneButton->setCheckable(true);
     reportMetricPaneButton->setChecked(true);
-    reportMetricPaneButton->setToolTip(QStringLiteral("显示或隐藏右侧核心指标"));
+    reportMetricPaneButton->setToolTip(QStringLiteral("显示或隐藏右侧复检指标"));
 
     reportToolbar->addWidget(reportParameterPaneButton);
     reportToolbar->addWidget(reportMetricPaneButton);
@@ -1027,6 +1232,24 @@ MainWindow::MainWindow(QWidget* parent)
     reportLayout->addWidget(reportSplit);
     stageStack_->addWidget(reportPage);
 
+    auto* compensationPage = new QWidget(central);
+    compensationPage->setObjectName(QStringLiteral("compensationStagePage"));
+    compensationViewer_ = new ImageViewer(compensationPage);
+    compensationSummaryEdit_ = makeReadOnlyTextEdit(compensationPage);
+    compensationSummaryEdit_->setMinimumHeight(180);
+    auto* compensationContent = new QSplitter(Qt::Vertical, compensationPage);
+    compensationContent->setChildrenCollapsible(false);
+    compensationContent->addWidget(compensationViewer_);
+    compensationContent->addWidget(compensationSummaryEdit_);
+    compensationContent->setStretchFactor(0, 6);
+    compensationContent->setStretchFactor(1, 2);
+    compensationContent->setSizes({700, 200});
+    auto* compensationLayout = new QVBoxLayout(compensationPage);
+    compensationLayout->setContentsMargins(0, 0, 0, 0);
+    compensationLayout->setSpacing(6);
+    compensationLayout->addWidget(compensationContent, 1);
+    stageStack_->addWidget(compensationPage);
+
     setCentralWidget(central);
 
     connect(startButton_, &QPushButton::clicked, this, [this]() { startRun(); });
@@ -1051,6 +1274,17 @@ MainWindow::MainWindow(QWidget* parent)
         refreshStageSummaries();
         updateWorkflowAccessState();
     });
+    connect(designModelPanel_, &DesignModelPanel::configChanged, this, [this]() {
+        refreshStageSummaries();
+        refreshDesignModelDetailPane();
+        updateWorkflowAccessState();
+    });
+    connect(designModelPanel_, &DesignModelPanel::importRequested, this, [this](const QString&) {
+        startDesignModelImport();
+    });
+    connect(designModelPanel_, &DesignModelPanel::scanCompareRequested, this, [this](const QString& stlFilePath) {
+        startScannedStlComparison(stlFilePath);
+    });
     connect(configPanel_, &RunConfigPanel::configChanged, this, [this]() {
         refreshStageSummaries();
         refreshReportExportState();
@@ -1060,21 +1294,37 @@ MainWindow::MainWindow(QWidget* parent)
         onAcquisitionPreviewUpdated(image, summary);
     });
 
-    calibrationOverviewEdit_->setPlainText(QStringLiteral("等待标定参数。"));
-    acquisitionOverviewEdit_->setPlainText(QStringLiteral("等待选择工件图像目录或完成在线采集。"));
-    calibrationDetailEdit_->setPlainText(QStringLiteral("等待标定结果。"));
-    processingPreviewInfoEdit_->setPlainText(QStringLiteral("等待预处理预览。"));
+    calibrationOverviewEdit_->setPlainText(QStringLiteral("模块 1 CAD/目标尺寸：等待量值标定参数。"));
+    designModelOverviewEdit_->setPlainText(QStringLiteral("模块 1 CAD/目标尺寸：等待选择 STEP/STP/IGES 理论模型，或选择扫描 STL 进行独立对比。"));
+    designModelDetailEdit_->setPlainText(QStringLiteral("导入后将在这里显示模型摘要、目标尺寸、坐标配置、截面方法与 CAD 坐标映射；扫描 STL 对比会复用同一结果展示页。"));
+    acquisitionOverviewEdit_->setPlainText(QStringLiteral("模块 2 数据接收预处理：等待选择工件图像目录或完成在线采集。"));
+    calibrationDetailEdit_->setPlainText(QStringLiteral("模块 1 CAD/目标尺寸：等待标定结果。"));
+    processingPreviewInfoEdit_->setPlainText(QStringLiteral("模块 3 特征提取：等待预处理预览和轮廓边界。"));
     if (qualityReviewEdit_) {
-        qualityReviewEdit_->setPlainText(QStringLiteral("等待拼接完成后生成 quality_review.csv。"));
+        qualityReviewEdit_->setPlainText(QStringLiteral("等待模块 5 误差分析生成 quality_review.csv。"));
     }
     if (designCompareEdit_) {
-        designCompareEdit_->setPlainText(QStringLiteral("等待拼接完成后生成设计母线比对结果。"));
+        designCompareEdit_->setPlainText(QStringLiteral("等待模块 5 误差分析生成 CAD/设计母线比对结果。"));
     }
     if (candidateDiagnosticsEdit_) {
-        candidateDiagnosticsEdit_->setPlainText(QStringLiteral("等待拼接完成后生成候选诊断结果。"));
+        candidateDiagnosticsEdit_->setPlainText(QStringLiteral("等待模块 4 生成候选诊断结果。"));
+    }
+    setAcceptanceText(buildInitialTable9AcceptanceText());
+    if (compensationSummaryEdit_) {
+        compensationSummaryEdit_->setPlainText(
+            QStringLiteral("模块 6 补偿解算\n\n"
+                           "等待模块 5 误差分析完成后生成补偿量可视化。\n"
+                           "这里将显示补偿曲线、CAD 点级补偿、槽特征补偿、补偿图/CSV 路径和关键字段说明。\n"
+                           "最终补偿后绝对坐标字段为 `compensated_cad_x/y/z_mm`。"));
     }
     if (publicationFigureViewer_) {
         publicationFigureViewer_->clearImage();
+    }
+    if (singleSlotViewer_) {
+        singleSlotViewer_->clearImage();
+    }
+    if (pointCloudViewer_) {
+        pointCloudViewer_->clearCloud();
     }
     statusBar()->showMessage(QStringLiteral("就绪"));
 
@@ -1083,6 +1333,7 @@ MainWindow::MainWindow(QWidget* parent)
     switchToStage(CalibrationStage);
     refreshStageSummaries();
     refreshCalibrationDetailPane();
+    refreshDesignModelDetailPane();
     refreshRegistrationToolState();
     refreshReportExportState();
 }
@@ -1115,6 +1366,487 @@ void MainWindow::startCurrentModuleRun()
     }
 
     startRun(runModeForStageIndex(currentStageIndex));
+}
+
+void MainWindow::startDesignModelImport()
+{
+    if (!designModelPanel_) {
+        return;
+    }
+
+    pinjie::cad_model::DesignModelRequest request;
+    QString errorMessage;
+    if (!designModelPanel_->buildRequest(request, errorMessage)) {
+        QMessageBox::warning(this, QStringLiteral("设计模型"), errorMessage);
+        switchToStage(CalibrationStage);
+        return;
+    }
+
+    lastDesignModelRequest_ = request;
+    switchToStage(CalibrationStage);
+    if (cadPreviewViewer_) {
+        cadPreviewViewer_->clearImage();
+    }
+    if (cadInteractiveViewer_) {
+        cadInteractiveViewer_->clearCloud(QStringLiteral("正在导入 CAD 模型，等待三维采样点。"));
+    }
+    designModelOverviewEdit_->setPlainText(QStringLiteral("正在导入设计模型，请稍候..."));
+    appendLog(QStringLiteral("[信息] 开始导入设计模型：%1")
+                  .arg(QDir::toNativeSeparators(fromUtf8StdString(request.cadFilePath))));
+
+    const auto result = pinjie::cad_model::loadCadModelDocument(std::filesystem::u8path(request.cadFilePath), request);
+    if (result.ok) {
+        activeCadModelDocument_ = result.document;
+        activeCadModelDocument_.modelLabel = request.modelName.empty()
+                                                 ? activeCadModelDocument_.modelLabel
+                                                 : request.modelName;
+        activeCadModelDocument_.axialAxis = request.axialAxis;
+        activeCadModelDocument_.radialAxis = request.radialAxis;
+        designModelPanel_->setDocumentInfo(activeCadModelDocument_);
+        if (cadInteractiveViewer_) {
+            cadInteractiveViewer_->setCadModelDocument(
+                activeCadModelDocument_,
+                QStringLiteral("CAD零件3D - %1")
+                    .arg(activeCadModelDocument_.modelLabel.empty()
+                             ? fromUtf8StdString(activeCadModelDocument_.fileName)
+                             : fromUtf8StdString(activeCadModelDocument_.modelLabel)),
+                QStringLiteral("显示导入 CAD 零件的三角网格面片；绿色线为 CAD 模型真实剖切截面。"));
+        }
+        generateCadModelPreview(activeCadModelDocument_);
+        designModelOverviewEdit_->setPlainText(
+            QStringLiteral("设计模型导入完成。\n文件：%1\n格式：%2\n面/边：%3 / %4\n真实截面预览：%5 点\n误差比对轮廓：%6 点")
+                .arg(QDir::toNativeSeparators(fromUtf8StdString(activeCadModelDocument_.sourcePath)))
+                .arg(fromUtf8StdString(pinjie::cad_model::cadFileFormatLabel(activeCadModelDocument_.format)))
+                .arg(activeCadModelDocument_.faceCount)
+                .arg(activeCadModelDocument_.edgeCount)
+                .arg(static_cast<qulonglong>(activeCadModelDocument_.sectionSamples.size()))
+                .arg(static_cast<qulonglong>(activeCadModelDocument_.profileSamples.size())));
+        appendLog(QStringLiteral("[信息] %1").arg(fromUtf8StdString(result.message)));
+        statusBar()->showMessage(QStringLiteral("设计模型已导入"), 4000);
+    } else {
+        activeCadModelDocument_ = {};
+        designModelPanel_->setDocumentInfo(result.document);
+        if (cadPreviewViewer_) {
+            cadPreviewViewer_->clearImage();
+        }
+        if (cadInteractiveViewer_) {
+            cadInteractiveViewer_->clearCloud(QStringLiteral("CAD导入失败，无法显示交互3D模型。"));
+        }
+        designModelOverviewEdit_->setPlainText(
+            QStringLiteral("设计模型导入失败。\n原因：%1").arg(fromUtf8StdString(result.message)));
+        appendLog(QStringLiteral("[错误] %1").arg(fromUtf8StdString(result.message)));
+        QMessageBox::warning(this,
+                             QStringLiteral("设计模型"),
+                             QStringLiteral("设计模型导入失败：\n%1").arg(fromUtf8StdString(result.message)));
+        statusBar()->showMessage(QStringLiteral("设计模型导入失败"), 4000);
+    }
+
+    refreshStageSummaries();
+    refreshDesignModelDetailPane();
+    updateWorkflowAccessState();
+    updateModuleRunButtonText(stageStack_ ? stageStack_->currentIndex() : CalibrationStage);
+}
+
+void MainWindow::startScannedStlComparison(const QString& stlFilePath)
+{
+    if (!designModelPanel_) {
+        return;
+    }
+    if (!activeCadModelDocument_.valid ||
+        (!activeCadModelDocument_.hasProfileSamples && !activeCadModelDocument_.hasSectionSamples)) {
+        QMessageBox::information(this,
+                                 QStringLiteral("扫描 STL 对比"),
+                                 QStringLiteral("请先导入理论 CAD 模型，再进行扫描 STL 对比。"));
+        switchToStage(CalibrationStage);
+        return;
+    }
+
+    const QString trimmedPath = stlFilePath.trimmed();
+    if (trimmedPath.isEmpty()) {
+        QMessageBox::information(this,
+                                 QStringLiteral("扫描 STL 对比"),
+                                 QStringLiteral("请先选择扫描 STL 文件。"));
+        switchToStage(CalibrationStage);
+        return;
+    }
+
+    const QFileInfo scanInfo(trimmedPath);
+    if (!scanInfo.exists() || !scanInfo.isFile()) {
+        QMessageBox::warning(this,
+                             QStringLiteral("扫描 STL 对比"),
+                             QStringLiteral("所选扫描 STL 文件不存在。"));
+        switchToStage(CalibrationStage);
+        return;
+    }
+
+    pinjie::cad_model::DesignModelRequest designRequest = lastDesignModelRequest_;
+    QString panelError;
+    pinjie::cad_model::DesignModelRequest panelRequest;
+    if (designModelPanel_->buildRequest(panelRequest, panelError)) {
+        designRequest.profileSamplingStepMm = panelRequest.profileSamplingStepMm;
+        designRequest.targetSlotWidthMm = panelRequest.targetSlotWidthMm;
+        designRequest.targetSlotDepthMm = panelRequest.targetSlotDepthMm;
+        designRequest.temporaryPixelSizeMm = panelRequest.temporaryPixelSizeMm;
+        designRequest.localSlotImageMode = panelRequest.localSlotImageMode;
+        designRequest.localSlotBottomWidthMm = panelRequest.localSlotBottomWidthMm;
+    }
+
+    pinjie::cad_model::DesignModelRequest scanRequest = designRequest;
+    scanRequest.cadFilePath = QDir::fromNativeSeparators(trimmedPath).toUtf8().toStdString();
+    scanRequest.modelName = scanInfo.completeBaseName().toUtf8().toStdString();
+
+    switchToStage(CalibrationStage);
+    appendLog(QStringLiteral("[信息] 开始扫描 STL 与理论 CAD 对比：%1")
+                  .arg(QDir::toNativeSeparators(trimmedPath)));
+    statusBar()->showMessage(QStringLiteral("正在导入扫描 STL 并执行对比..."));
+    if (designCompareEdit_) {
+        designCompareEdit_->setPlainText(QStringLiteral("正在导入扫描 STL 并执行理论 CAD 对比..."));
+    }
+    if (compensationSummaryEdit_) {
+        compensationSummaryEdit_->setPlainText(QStringLiteral("正在计算扫描 STL 的误差与补偿量..."));
+    }
+
+    const auto scanLoadResult =
+        pinjie::cad_model::loadCadModelDocument(std::filesystem::u8path(scanRequest.cadFilePath), scanRequest);
+    if (!scanLoadResult.ok) {
+        appendLog(QStringLiteral("[错误] %1").arg(fromUtf8StdString(scanLoadResult.message)));
+        QMessageBox::warning(this,
+                             QStringLiteral("扫描 STL 对比"),
+                             QStringLiteral("扫描 STL 导入失败：\n%1").arg(fromUtf8StdString(scanLoadResult.message)));
+        statusBar()->showMessage(QStringLiteral("扫描 STL 导入失败"), 4000);
+        return;
+    }
+
+    const pinjie::cad_model::CadModelDocument& scanDocument = scanLoadResult.document;
+    if (cadInteractiveViewer_) {
+        cadInteractiveViewer_->setCadModelDocument(
+            scanDocument,
+            QStringLiteral("扫描 STL 点云 - %1").arg(scanInfo.completeBaseName()),
+            QStringLiteral("显示扫描 STL 的三维点云；可拖拽旋转、平移与缩放查看。"));
+    }
+    const bool hasMeasuredProfile = scanDocument.hasProfileSamples && scanDocument.profileSamples.size() >= 2;
+    const bool hasMeasuredSection = scanDocument.hasSectionSamples && scanDocument.sectionSamples.size() >= 2;
+    if (!hasMeasuredProfile && !hasMeasuredSection) {
+        QMessageBox::warning(this,
+                             QStringLiteral("扫描 STL 对比"),
+                             QStringLiteral("扫描 STL 已导入，但未生成可用于对比的截面/轮廓样本。"));
+        statusBar()->showMessage(QStringLiteral("扫描 STL 缺少可对比轮廓"), 4000);
+        return;
+    }
+
+    const std::string runName =
+        (activeCadModelDocument_.modelLabel.empty() ? std::string("design_cad") : activeCadModelDocument_.modelLabel) +
+        "_scan_vs_" + scanInfo.completeBaseName().toUtf8().toStdString();
+    const auto resultPaths = pinjie::buildDefaultStitchResultPaths(runName, "scan_vs_cad", false);
+    if (!pinjie::ensureStitchResultDirectories(resultPaths)) {
+        QMessageBox::warning(this,
+                             QStringLiteral("扫描 STL 对比"),
+                             QStringLiteral("结果目录创建失败。"));
+        statusBar()->showMessage(QStringLiteral("结果目录创建失败"), 4000);
+        return;
+    }
+
+    pinjie::StitchRunRequest compareRequest;
+    compareRequest.resultOutputDir = resultPaths.runDir.u8string();
+    compareRequest.designErrorProfileCsvOutputPath = resultPaths.designErrorProfileCsvPath.u8string();
+    compareRequest.designErrorSummaryCsvOutputPath = resultPaths.designErrorSummaryCsvPath.u8string();
+    compareRequest.design3dErrorCsvOutputPath = resultPaths.design3dErrorCsvPath.u8string();
+    compareRequest.designCompensationCsvOutputPath = resultPaths.designCompensationCsvPath.u8string();
+    compareRequest.designFeatureCompensationCsvOutputPath = resultPaths.designFeatureCompensationCsvPath.u8string();
+    compareRequest.pipelineConfig.enableDesignComparison = true;
+    applyActiveDesignModelToRequest(compareRequest);
+    compareRequest.pipelineConfig.enableDesignComparison = true;
+
+    const std::vector<pinjie::cad_design::DesignProfileSample>& measuredSamples =
+        compareRequest.pipelineConfig.localSlotImageMode && hasMeasuredSection
+            ? scanDocument.sectionSamples
+            : (hasMeasuredProfile ? scanDocument.profileSamples : scanDocument.sectionSamples);
+    const pinjie::cad_design::DesignAlignmentResult designResult =
+        pinjie::cad_design::compareMeasuredCadProfileToDesign(measuredSamples, compareRequest.pipelineConfig);
+    if (!designResult.ok) {
+        appendLog(QStringLiteral("[错误] %1").arg(fromUtf8StdString(designResult.message)));
+        if (designCompareEdit_) {
+            designCompareEdit_->setPlainText(
+                QStringLiteral("扫描 STL 与理论 CAD 对比失败。\n%1")
+                    .arg(fromUtf8StdString(designResult.message)));
+        }
+        if (designCompareViewer_) {
+            designCompareViewer_->clearImage();
+        }
+        if (compensationViewer_) {
+            compensationViewer_->clearImage();
+        }
+        if (pointCloudViewer_) {
+            pointCloudViewer_->clearCloud(QStringLiteral("扫描 STL 对比失败，未生成三维误差点云。"));
+        }
+        if (compensationSummaryEdit_) {
+            compensationSummaryEdit_->setPlainText(
+                QStringLiteral("扫描 STL 对比未生成补偿结果。\n%1")
+                    .arg(fromUtf8StdString(designResult.message)));
+        }
+        QMessageBox::warning(this,
+                             QStringLiteral("扫描 STL 对比"),
+                             QStringLiteral("对比失败：\n%1").arg(fromUtf8StdString(designResult.message)));
+        statusBar()->showMessage(QStringLiteral("扫描 STL 对比失败"), 4000);
+        return;
+    }
+
+    const auto saveTextArtifact = [&](const std::string& path,
+                                      const std::string& content,
+                                      const QString& label) -> bool {
+        if (path.empty()) {
+            return true;
+        }
+        if (stitch::writeTextFileToPath(path, content)) {
+            return true;
+        }
+        QMessageBox::warning(this,
+                             QStringLiteral("扫描 STL 对比"),
+                             QStringLiteral("保存 %1 失败：\n%2").arg(label, displayOutputPath(path)));
+        return false;
+    };
+    if (!saveTextArtifact(compareRequest.designErrorProfileCsvOutputPath,
+                          designResult.profileCsvText,
+                          QStringLiteral("design_error_profile.csv")) ||
+        !saveTextArtifact(compareRequest.designErrorSummaryCsvOutputPath,
+                          designResult.summaryCsvText,
+                          QStringLiteral("design_error_summary.csv")) ||
+        !saveTextArtifact(compareRequest.design3dErrorCsvOutputPath,
+                          designResult.error3dCsvText,
+                          QStringLiteral("design_3d_error_points.csv")) ||
+        !saveTextArtifact(compareRequest.designCompensationCsvOutputPath,
+                          designResult.compensationCsvText,
+                          QStringLiteral("design_compensation.csv")) ||
+        !saveTextArtifact(compareRequest.designFeatureCompensationCsvOutputPath,
+                          designResult.featureCompensationCsvText,
+                          QStringLiteral("design_feature_compensation.csv"))) {
+        statusBar()->showMessage(QStringLiteral("扫描 STL 结果保存失败"), 4000);
+        return;
+    }
+
+    QString plotError;
+    QString plotOutput;
+    const bool plotOk = generateMatplotlibDesignPlots(compareRequest, true, plotError, &plotOutput);
+    if (!plotOutput.isEmpty()) {
+        appendLog(QStringLiteral("[图形脚本]\n%1").arg(plotOutput));
+    }
+    if (!plotOk) {
+        appendLog(QStringLiteral("[警告] %1").arg(plotError));
+    }
+
+    lastRequest_ = compareRequest;
+    currentRunMode_ = pinjie::StitchRunMode::Report;
+    runCache_.reset();
+    completedSteps_.clear();
+    preprocessImages_.clear();
+    debugImages_.clear();
+    if (stepModel_) {
+        stepModel_->clear();
+    }
+    if (processingImageList_) {
+        processingImageList_->clear();
+    }
+    if (panoramaViewer_) {
+        panoramaViewer_->clearImage();
+    }
+    if (referenceViewer_) {
+        referenceViewer_->clearImage();
+    }
+    if (targetViewer_) {
+        targetViewer_->clearImage();
+    }
+    if (debugViewer_) {
+        debugViewer_->clearImage();
+    }
+    if (qualityReviewEdit_) {
+        qualityReviewEdit_->setPlainText(QStringLiteral("扫描 STL 对比分支未生成拼接质量审查 CSV。"));
+    }
+    if (candidateDiagnosticsEdit_) {
+        candidateDiagnosticsEdit_->setPlainText(QStringLiteral("扫描 STL 对比分支未经过拼接候选诊断流程。"));
+    }
+    if (csvEdit_) {
+        csvEdit_->setPlainText(fromUtf8StdString(designResult.summaryCsvText));
+    }
+
+    QStringList compareLines;
+    compareLines << QStringLiteral("扫描 STL 与理论 CAD 对比完成");
+    compareLines << QString();
+    compareLines << QStringLiteral("理论 CAD：%1")
+                        .arg(fromUtf8StdString(activeCadModelDocument_.modelLabel.empty()
+                                                   ? activeCadModelDocument_.fileName
+                                                   : activeCadModelDocument_.modelLabel));
+    compareLines << QStringLiteral("扫描 STL：%1").arg(QDir::toNativeSeparators(trimmedPath));
+    compareLines << QStringLiteral("扫描样本：%1 点（使用 %2 进行误差解算）")
+                        .arg(static_cast<qulonglong>(measuredSamples.size()))
+                        .arg(hasMeasuredProfile && !(compareRequest.pipelineConfig.localSlotImageMode && hasMeasuredSection)
+                                 ? QStringLiteral("扫描轮廓 profileSamples")
+                                 : QStringLiteral("扫描截面 sectionSamples"));
+    compareLines << QStringLiteral("有效对比点：%1").arg(static_cast<qulonglong>(designResult.summary.usedCount));
+    compareLines << QStringLiteral("轮廓 RMS：%1 um")
+                        .arg(formatMetric(designResult.summary.profileStats.rmseUm, 3));
+    compareLines << QStringLiteral("轮廓 P95：%1 um")
+                        .arg(formatMetric(designResult.summary.profileStats.p95AbsUm, 3));
+    compareLines << QStringLiteral("补偿偏置：%1 um")
+                        .arg(formatMetric(designResult.summary.meanNormalErrorUm, 3));
+    compareLines << QStringLiteral("结果说明：%1").arg(fromUtf8StdString(designResult.message));
+    compareLines << QStringLiteral("结果目录：%1").arg(displayOutputPath(compareRequest.resultOutputDir));
+    if (!plotOk) {
+        compareLines << QStringLiteral("图表生成：%1").arg(plotError);
+    }
+    if (designCompareEdit_) {
+        designCompareEdit_->setPlainText(compareLines.join('\n'));
+    }
+
+    QImage contourPreview;
+    if (!compareRequest.contourOverlayOutputPath.empty()) {
+        contourPreview.load(displayOutputPath(compareRequest.contourOverlayOutputPath));
+    }
+    if (processingPreviewViewer_) {
+        if (!contourPreview.isNull()) {
+            processingPreviewViewer_->setImage(contourPreview);
+        } else {
+            processingPreviewViewer_->clearImage();
+        }
+    }
+    if (processingPreviewInfoEdit_) {
+        processingPreviewInfoEdit_->setPlainText(
+            contourPreview.isNull()
+                ? QStringLiteral("扫描 STL 对比分支未生成单槽/特征预览图。")
+                : QStringLiteral("扫描 STL 对比分支：已加载单槽/特征预览图。\n输出图：%1")
+                      .arg(displayOutputPath(compareRequest.contourOverlayOutputPath)));
+    }
+    if (singleSlotViewer_) {
+        if (!contourPreview.isNull()) {
+            singleSlotViewer_->setImage(contourPreview);
+        } else {
+            singleSlotViewer_->clearImage();
+        }
+    }
+
+    if (designCompareViewer_) {
+        QImage designComparisonPlot;
+        if (!compareRequest.designComparisonOverlayOutputPath.empty()) {
+            designComparisonPlot.load(displayOutputPath(compareRequest.designComparisonOverlayOutputPath));
+        }
+        if (!designComparisonPlot.isNull()) {
+            designCompareViewer_->setImage(designComparisonPlot);
+        } else {
+            designCompareViewer_->clearImage();
+        }
+    }
+    if (compensationViewer_) {
+        QImage compensationPlot;
+        if (!compareRequest.designCompensationPlotOutputPath.empty()) {
+            compensationPlot.load(displayOutputPath(compareRequest.designCompensationPlotOutputPath));
+        }
+        if (!compensationPlot.isNull()) {
+            compensationViewer_->setImage(compensationPlot);
+        } else {
+            compensationViewer_->clearImage();
+        }
+    }
+    if (pointCloudViewer_) {
+        const QString pointCloudCsvPath =
+            compareRequest.design3dErrorCsvOutputPath.empty()
+                ? QString()
+                : displayOutputPath(compareRequest.design3dErrorCsvOutputPath);
+        QString pointCloudMessage;
+        if (!pointCloudCsvPath.isEmpty() &&
+            pointCloudViewer_->loadDesignErrorCsv(pointCloudCsvPath, &pointCloudMessage)) {
+            if (!pointCloudMessage.isEmpty()) {
+                appendLog(QStringLiteral("[信息] %1").arg(pointCloudMessage));
+            }
+        } else {
+            pointCloudViewer_->clearCloud(
+                pointCloudCsvPath.isEmpty()
+                    ? QStringLiteral("扫描 STL 对比分支未生成三维误差 CSV。")
+                    : QStringLiteral("扫描 STL 对比分支未能加载三维误差点云。"));
+        }
+    }
+
+    if (compensationSummaryEdit_) {
+        const std::size_t cadCompensationRows =
+            static_cast<std::size_t>(std::count_if(designResult.profilePoints.begin(),
+                                                   designResult.profilePoints.end(),
+                                                   [](const auto& point) {
+                                                       return point.isUsed && point.hasCadCoordinates;
+                                                   }));
+        QStringList compensationLines;
+        compensationLines << QStringLiteral("模块 6 补偿解算");
+        compensationLines << QString();
+        compensationLines << QStringLiteral("扫描 STL 对比模式：已输出理论 CAD 坐标系下的点级补偿结果。");
+        compensationLines << QStringLiteral("有效 CAD 补偿点：%1 / %2")
+                                 .arg(static_cast<qulonglong>(cadCompensationRows))
+                                 .arg(static_cast<qulonglong>(designResult.summary.usedCount));
+        compensationLines << QStringLiteral("CAD 坐标轴：轴向 %1，径向 %2，轴向原点 %3 mm，方向系数 %4")
+                                 .arg(fromUtf8StdString(designResult.summary.designProfileMetadata.axialAxis),
+                                      fromUtf8StdString(designResult.summary.designProfileMetadata.radialAxis))
+                                 .arg(designResult.summary.designProfileMetadata.cadAxialOriginMm, 0, 'f', 6)
+                                 .arg(designResult.summary.designProfileMetadata.cadAxialDirectionSign, 0, 'f', 0);
+        compensationLines << QStringLiteral("绝对坐标字段：`compensated_cad_x/y/z_mm`");
+        compensationLines << QStringLiteral("补偿增量字段：`delta_x/y/z_um`");
+        compensationLines << QString();
+        compensationLines << QStringLiteral("输出文件");
+        compensationLines << QStringLiteral("误差明细 CSV：%1")
+                                 .arg(displayOutputPath(compareRequest.designErrorProfileCsvOutputPath));
+        compensationLines << QStringLiteral("误差汇总 CSV：%1")
+                                 .arg(displayOutputPath(compareRequest.designErrorSummaryCsvOutputPath));
+        compensationLines << QStringLiteral("三维误差 CSV：%1")
+                                 .arg(displayOutputPath(compareRequest.design3dErrorCsvOutputPath));
+        compensationLines << QStringLiteral("CAD 补偿 CSV：%1")
+                                 .arg(displayOutputPath(compareRequest.designCompensationCsvOutputPath));
+        compensationLines << QStringLiteral("槽特征补偿 CSV：%1")
+                                 .arg(displayOutputPath(compareRequest.designFeatureCompensationCsvOutputPath));
+        compensationLines << QStringLiteral("补偿图 PNG：%1")
+                                 .arg(displayOutputPath(compareRequest.designCompensationPlotOutputPath));
+        compensationLines << QStringLiteral("3D 点云 PNG：%1")
+                                 .arg(designPointCloudPngPath(compareRequest));
+        compensationLines << QString();
+        compensationLines << QStringLiteral("槽特征补偿预览");
+        compensationLines << QStringLiteral("----------------------------------------");
+        compensationLines << (fromUtf8StdString(designResult.featureCompensationCsvText).trimmed().isEmpty()
+                                  ? QStringLiteral("本次扫描 STL 对比未生成槽特征补偿表。")
+                                  : fromUtf8StdString(designResult.featureCompensationCsvText).trimmed());
+        if (!plotOk) {
+            compensationLines << QString();
+            compensationLines << QStringLiteral("图表脚本提示");
+            compensationLines << plotError;
+        }
+        compensationSummaryEdit_->setPlainText(compensationLines.join('\n'));
+    }
+
+    QStringList summaryLines;
+    summaryLines << QStringLiteral("扫描 STL 与理论 CAD 对比完成");
+    summaryLines << QString();
+    summaryLines << QStringLiteral("理论 CAD：%1")
+                        .arg(fromUtf8StdString(activeCadModelDocument_.sourcePath));
+    summaryLines << QStringLiteral("扫描 STL：%1").arg(QDir::toNativeSeparators(trimmedPath));
+    summaryLines << QStringLiteral("扫描导入摘要：%1").arg(fromUtf8StdString(scanLoadResult.message));
+    summaryLines << QStringLiteral("对齐结果：%1").arg(fromUtf8StdString(designResult.message));
+    summaryLines << QStringLiteral("轮廓 RMS：%1 um")
+                        .arg(formatMetric(designResult.summary.profileStats.rmseUm, 3));
+    summaryLines << QStringLiteral("轮廓 P95：%1 um")
+                        .arg(formatMetric(designResult.summary.profileStats.p95AbsUm, 3));
+    summaryLines << QStringLiteral("有效对比点：%1")
+                        .arg(static_cast<qulonglong>(designResult.summary.usedCount));
+    summaryLines << QStringLiteral("结果目录：%1").arg(displayOutputPath(compareRequest.resultOutputDir));
+    if (!plotOk) {
+        summaryLines << QStringLiteral("图表生成：%1").arg(plotError);
+    }
+    if (summaryEdit_) {
+        summaryEdit_->setPlainText(summaryLines.join('\n'));
+    }
+
+    setAcceptanceText(buildTable9AcceptanceText(true, 0, 0, &designResult, &designResult.summary));
+    updateReportMetricCards(0, 0, nullptr, &designResult.summary);
+    refreshRegistrationToolState();
+    refreshReportExportState(QStringLiteral("归档状态：扫描 STL 与理论 CAD 对比结果已写入结果目录。"));
+    refreshStageSummaries();
+    bottomTabs_->setCurrentWidget(summaryEdit_);
+    switchToStage(ReportStage);
+    statusBar()->showMessage(QStringLiteral("扫描 STL 与理论 CAD 对比完成"), 4000);
+    appendLog(QStringLiteral("[信息] 扫描 STL 对比结果目录：%1")
+                  .arg(displayOutputPath(compareRequest.resultOutputDir)));
 }
 
 void MainWindow::startCalibration()
@@ -1184,10 +1916,64 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
     }
 
     const bool standardCircleMode = isStandardCircleMode(request);
-    if (!standardCircleMode && !hasActiveCalibration()) {
+    pinjie::cad_model::DesignModelRequest panelDesignRequest;
+    QString panelDesignError;
+    const bool panelDesignReady =
+        designModelPanel_ && designModelPanel_->buildRequest(panelDesignRequest, panelDesignError);
+    const bool panelLocalSlotMode = !standardCircleMode && panelDesignReady && panelDesignRequest.localSlotImageMode;
+    const auto applyPanelLocalSlotMode = [&](pinjie::StitchRunRequest& target) {
+        if (!panelLocalSlotMode) {
+            return;
+        }
+        target.pipelineConfig.localSlotImageMode = true;
+        target.pipelineConfig.localSlotBottomWidthMm = panelDesignRequest.localSlotBottomWidthMm;
+        target.pipelineConfig.designTargetSlotWidthMm =
+            panelDesignRequest.targetSlotWidthMm > 0.0
+                ? panelDesignRequest.targetSlotWidthMm
+                : panelDesignRequest.localSlotBottomWidthMm;
+        target.pipelineConfig.designTargetSlotDepthMm = panelDesignRequest.targetSlotDepthMm;
+        const bool hasExternalCadProfile =
+            target.pipelineConfig.designUseExternalProfile &&
+            target.pipelineConfig.designExternalProfileSamples.size() >= 2;
+        if (!hasExternalCadProfile) {
+            target.pipelineConfig.designUseExternalProfile = false;
+            target.pipelineConfig.designExternalProfileSamples.clear();
+            target.pipelineConfig.designProfileMetadata = {};
+        }
+        target.pipelineConfig.designUseCentralSlotImageRoi = false;
+        if (target.imagePaths.size() > 1) {
+            target.imagePaths.resize(1);
+        }
+    };
+    if (panelLocalSlotMode) {
+        applyPanelLocalSlotMode(request);
+        appendLog(QStringLiteral("[信息] 已启用局部槽特征检测并接入 CAD 对比页：槽底标定宽度 %1 mm，仅使用第一张局部单槽图。")
+                      .arg(panelDesignRequest.localSlotBottomWidthMm, 0, 'f', 4));
+    }
+    const auto applyBaselineToRequest = [this](pinjie::StitchRunRequest& target) {
+        const double pixelSizeMm = calibrationPixelSizeMm(activeCalibrationCache_);
+        if (pixelSizeMm > 0.0) {
+            target.pipelineConfig.designPixelSizeMm = pixelSizeMm;
+        }
+        applyActiveDesignModelToRequest(target);
+    };
+
+    if (!standardCircleMode) {
+        applyBaselineToRequest(request);
+        applyPanelLocalSlotMode(request);
+        const double testPixelSizeMm = singleSlotTestPixelSizeMm(request);
+        if (testPixelSizeMm > 0.0) {
+            appendLog(QStringLiteral("[信息] 检测到 CAD 匹配单槽测试图，已自动使用 %1 mm/px 的测试像素当量。")
+                          .arg(testPixelSizeMm, 0, 'f', 10));
+        }
+    }
+    if (!standardCircleMode &&
+        !request.pipelineConfig.localSlotImageMode &&
+        !hasMeasurementBaseline() &&
+        !isSingleSlotTestInput(request)) {
         QMessageBox::information(this,
                                  QStringLiteral("需要标定"),
-                                 QStringLiteral("请先加载有效的标定结果，再运行当前阶段。"));
+                                 QStringLiteral("请先加载有效的标定结果；若只是用当前 CAD 与临时/公开图片测试，请在 CAD/目标尺寸模块填写临时像素当量并重新导入 CAD。"));
         switchToStage(CalibrationStage);
         return;
     }
@@ -1206,6 +1992,37 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
     } else if (!configPanel_->buildRequest(request, errorMessage, true)) {
         QMessageBox::warning(this, QStringLiteral("运行配置"), errorMessage);
         switchToStage(AcquisitionStage);
+        return;
+    } else if (!standardCircleMode) {
+        applyBaselineToRequest(request);
+        applyPanelLocalSlotMode(request);
+    }
+
+    const bool requestsDesignAnalysis =
+        !standardCircleMode &&
+        (runMode == pinjie::StitchRunMode::Full || runMode == pinjie::StitchRunMode::Report);
+    const bool hasUsableCadProfile =
+        activeCadModelDocument_.valid &&
+        activeCadModelDocument_.hasProfileSamples &&
+        activeCadModelDocument_.profileSamples.size() >= 2;
+    const bool hasUsableDesignSource = hasUsableCadProfile || request.pipelineConfig.localSlotImageMode;
+    const bool allowFullRunWithoutCad =
+        !standardCircleMode &&
+        runMode == pinjie::StitchRunMode::Full &&
+        !request.pipelineConfig.localSlotImageMode &&
+        !hasUsableCadProfile;
+
+    request.pipelineConfig.enableDesignComparison = requestsDesignAnalysis && hasUsableDesignSource;
+    if (allowFullRunWithoutCad) {
+        appendLog(QStringLiteral("[信息] 未导入可用 CAD 设计基准，本次将仅执行工件拼接/常规结果输出，跳过 CAD 误差分析与补偿解算。"));
+    } else if (requestsDesignAnalysis && !hasUsableDesignSource) {
+        QMessageBox::warning(this,
+                             QStringLiteral("CAD误差分析未就绪"),
+                             QStringLiteral("全流程、误差分析和补偿解算需要一个可用设计基准：\n"
+                                            "1. 导入可用 CAD 模型并生成 CAD X/Y/Z 采样轮廓；或\n"
+                                            "2. 在模块 1 启用“局部槽特征检测”，用单槽截图和槽底真实宽度作为基准。\n\n"
+                                            "如果只想检查图像预处理或模型配准，请运行模块 2/3/4。"));
+        switchToStage(CalibrationStage);
         return;
     }
 
@@ -1229,6 +2046,9 @@ void MainWindow::startRun(pinjie::StitchRunMode runMode)
     panoramaViewer_->clearImage();
     if (designCompareViewer_) {
         designCompareViewer_->clearImage();
+    }
+    if (pointCloudViewer_) {
+        pointCloudViewer_->clearCloud();
     }
     if (reportViewTabs_ && panoramaViewer_) {
         reportViewTabs_->setCurrentWidget(panoramaViewer_);
@@ -1360,7 +2180,7 @@ void MainWindow::onCalibrationFinished(bool ok,
         calibrationOverviewEdit_->setPlainText(
             loadedFromCache ? QStringLiteral("标定结果已从缓存加载。")
                             : QStringLiteral("标定完成。"));
-        switchToStage(AcquisitionStage);
+        switchToStage(CalibrationStage);
     } else if (!ok) {
         calibrationOverviewEdit_->setPlainText(QStringLiteral("标定失败，请查看日志。"));
         switchToStage(CalibrationStage);
@@ -1458,7 +2278,7 @@ void MainWindow::onAcquisitionPreviewUpdated(const QImage& image, const QString&
 
     if (acquisitionPreviewInfoEdit_) {
         acquisitionPreviewInfoEdit_->setPlainText(summary.isEmpty()
-                                                      ? QStringLiteral("等待相机采集预览。")
+                                                      ? QStringLiteral("等待导入图像或相机采集预览。")
                                                       : summary);
     }
 
@@ -1501,6 +2321,14 @@ void MainWindow::onRunFinished(bool ok,
 
     if (!panorama.isNull()) {
         panoramaViewer_->setImage(panorama);
+    } else if (!lastRequest_.panoramaOutputPath.empty()) {
+        const QImage panoramaFromFile(displayOutputPath(lastRequest_.panoramaOutputPath));
+        if (!panoramaFromFile.isNull()) {
+            panoramaViewer_->setImage(panoramaFromFile);
+        } else {
+            appendLog(QStringLiteral("[警告] 全景结果图未能加载：%1")
+                          .arg(displayOutputPath(lastRequest_.panoramaOutputPath)));
+        }
     }
 
     appendLog(ok ? QStringLiteral("[信息] %1已完成").arg(runModeLabel(currentRunMode_))
@@ -1532,6 +2360,12 @@ void MainWindow::onRunFinished(bool ok,
         }
         if (publicationFigureViewer_) {
             publicationFigureViewer_->clearImage();
+        }
+        if (singleSlotViewer_) {
+            singleSlotViewer_->clearImage();
+        }
+        if (pointCloudViewer_) {
+            pointCloudViewer_->clearCloud();
         }
 
         const QString summaryCsv = readUtf8TextFile(lastRequest_.csvOutputPath);
@@ -1578,9 +2412,18 @@ void MainWindow::onRunFinished(bool ok,
                 diagnostics.isEmpty() ? QStringLiteral("本次运行未生成掩模诊断。")
                                       : diagnostics.join(QStringLiteral("\n\n")));
         }
+        if (compensationViewer_) {
+            compensationViewer_->clearImage();
+        }
+        if (compensationSummaryEdit_) {
+            compensationSummaryEdit_->setPlainText(
+                QStringLiteral("国标标准圆检测模式\n\n"
+                               "该模式输出 25 视场形状误差和窗口诊断，不执行 CAD 点级补偿或槽特征补偿。\n"
+                               "补偿解算模块仅适用于已导入 CAD 基准的工件轮廓检测。"));
+        }
 
         QStringList summaryLines;
-        summaryLines << QStringLiteral("标准圆国标检测结果");
+        summaryLines << QStringLiteral("国标复检总览");
         summaryLines << QString();
         summaryLines << QStringLiteral("运行结果：%1").arg(ok ? QStringLiteral("成功") : QStringLiteral("失败"));
         summaryLines << QStringLiteral("已加载图像：%1").arg(loadedImageCount);
@@ -1650,6 +2493,32 @@ void MainWindow::onRunFinished(bool ok,
                                 .arg(QDir::toNativeSeparators(fromUtf8StdString(radiiCsvPath)));
         }
 
+        if (acceptanceChecklistEdit_) {
+            QStringList acceptanceLines;
+            acceptanceLines << QStringLiteral("国标复检清单");
+            acceptanceLines << QString();
+            acceptanceLines << QStringLiteral("模块 1 CAD/目标尺寸：%1；标准圆直径 %2 mm")
+                                   .arg(hasActiveCalibration() ? QStringLiteral("已加载标定结果")
+                                                               : QStringLiteral("标准圆模式使用标准圆直径修正像素当量"))
+                                   .arg(lastRequest_.standardCircleConfig.sphereDiameterMm, 0, 'f', 5);
+            acceptanceLines << QStringLiteral("模块 2 数据接收预处理：已加载 %1 张图像").arg(loadedImageCount);
+            acceptanceLines << QStringLiteral("模块 3 特征提取：候选覆盖、主暗区掩模、支撑差异掩模已生成则视为可复核");
+            acceptanceLines << QStringLiteral("模块 4 模型配准：标准圆模式按固定 25 视场检测链复核");
+            acceptanceLines << QStringLiteral("模块 5 误差分析：%1")
+                                   .arg(summaryText.isEmpty() ? QStringLiteral("未生成国标摘要 CSV")
+                                                              : QStringLiteral("已生成国标摘要 CSV"));
+            acceptanceLines << QStringLiteral("模块 6 补偿解算：标准圆模式不执行 CAD 补偿；%1")
+                                   .arg(ok ? QStringLiteral("通过，结果文件已写入目录")
+                                           : QStringLiteral("失败，请检查日志"));
+            acceptanceLines << QString();
+            acceptanceLines << QStringLiteral("证据文件");
+            acceptanceLines << QStringLiteral("摘要 CSV：%1").arg(displayOutputPath(lastRequest_.csvOutputPath));
+            acceptanceLines << QStringLiteral("25 点详情 CSV：%1").arg(displayOutputPath(lastRequest_.contourPointsCsvOutputPath));
+            acceptanceLines << QStringLiteral("候选覆盖/质量 CSV：%1").arg(displayOutputPath(lastRequest_.qualityReviewCsvOutputPath));
+            acceptanceLines << QStringLiteral("掩模/候选诊断 CSV：%1").arg(displayOutputPath(lastRequest_.alignmentCandidateDiagnosticsCsvOutputPath));
+            setAcceptanceText(acceptanceLines.join('\n'));
+        }
+
         summaryEdit_->setPlainText(summaryLines.join('\n'));
         bottomTabs_->setCurrentWidget(summaryEdit_);
         resetReportMetricCards();
@@ -1691,6 +2560,252 @@ void MainWindow::onRunFinished(bool ok,
         return;
     }
 
+    const bool localSlot2dFallbackMode = lastRequest_.pipelineConfig.localSlotImageMode;
+    if (localSlot2dFallbackMode) {
+        completedSteps_.clear();
+        if (stepModel_) {
+            stepModel_->clear();
+        }
+        csvEdit_->setPlainText(csvText.isEmpty() ? readUtf8TextFile(lastRequest_.csvOutputPath) : csvText);
+        if (qualityReviewEdit_) {
+            const QString reviewText = readUtf8TextFile(lastRequest_.qualityReviewCsvOutputPath);
+            qualityReviewEdit_->setPlainText(
+                reviewText.isEmpty() ? QStringLiteral("本次局部槽运行未生成质量审查 CSV。") : reviewText);
+        }
+        if (candidateDiagnosticsEdit_) {
+            const QString contourText = readUtf8TextFile(lastRequest_.contourPointsCsvOutputPath);
+            candidateDiagnosticsEdit_->setPlainText(
+                contourText.isEmpty() ? QStringLiteral("本次局部槽运行未生成轮廓点 CSV。") : contourText.left(12000));
+        }
+
+        const QImage contourPlot(displayOutputPath(lastRequest_.contourOverlayOutputPath));
+        if (processingPreviewViewer_) {
+            if (!contourPlot.isNull()) {
+                processingPreviewViewer_->setImage(contourPlot);
+            } else {
+                processingPreviewViewer_->clearImage();
+            }
+        }
+        if (singleSlotViewer_) {
+            if (!contourPlot.isNull()) {
+                singleSlotViewer_->setImage(contourPlot);
+            } else {
+                singleSlotViewer_->clearImage();
+            }
+        }
+        if (processingPreviewInfoEdit_) {
+            processingPreviewInfoEdit_->setPlainText(
+                QStringLiteral("模块 3 特征提取：局部槽特征检测已完成二值化、骨架边缘提取和槽边缘拟合。\n输出图：%1")
+                    .arg(displayOutputPath(lastRequest_.contourOverlayOutputPath)));
+        }
+
+        const QImage designPlot(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+        if (designCompareViewer_) {
+            if (!designPlot.isNull()) {
+                designCompareViewer_->setImage(designPlot);
+            } else {
+                designCompareViewer_->clearImage();
+            }
+        }
+        const QString summaryCsv = readUtf8TextFile(lastRequest_.designErrorSummaryCsvOutputPath);
+        const QString profileCsv = readUtf8TextFile(lastRequest_.designErrorProfileCsvOutputPath);
+        const QHash<QString, QString> designSummaryMetrics = parseFirstCsvDataRow(summaryCsv);
+        const QString localExceedanceThreshold =
+            designSummaryMetrics.value(QStringLiteral("local_exceedance_threshold_um"), QStringLiteral("--"));
+        const QString localExceedanceCount =
+            designSummaryMetrics.value(QStringLiteral("local_exceedance_count"), QStringLiteral("--"));
+        const QString localMaxAbsError =
+            designSummaryMetrics.value(QStringLiteral("local_max_abs_error_um"), QStringLiteral("--"));
+        const QString localMaxExceedance =
+            designSummaryMetrics.value(QStringLiteral("local_max_exceedance_um"), QStringLiteral("--"));
+        const QString localExceedanceSummary =
+            QStringLiteral("局部超差标注：阈值 ±%1 um，超差点 %2 个，最大绝对误差 %3 um，最大超差量 %4 um。")
+                .arg(localExceedanceThreshold,
+                     localExceedanceCount,
+                     localMaxAbsError,
+                     localMaxExceedance);
+        if (designCompareEdit_) {
+            QStringList lines;
+            lines << QStringLiteral("模块 5 误差分析：局部槽特征检测");
+            lines << QString();
+            lines << QStringLiteral("说明：本模式不再执行旧 ROI 或整件 CAD 母线比对；检测槽边缘与拟合理想槽边缘在统一截面内完成对齐。");
+            lines << QStringLiteral("误差分析图：%1").arg(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+            lines << QStringLiteral("图中红色线段/红点为超过阈值的局部超差位置。");
+            lines << localExceedanceSummary;
+            lines << QString();
+            lines << QStringLiteral("误差汇总 CSV");
+            lines << QStringLiteral("----------------------------------------");
+            lines << (summaryCsv.trimmed().isEmpty() ? QStringLiteral("未生成。") : summaryCsv.trimmed());
+            lines << QString();
+            lines << QStringLiteral("误差明细预览");
+            lines << QStringLiteral("----------------------------------------");
+            lines << (profileCsv.trimmed().isEmpty() ? QStringLiteral("未生成。") : profileCsv.left(5000));
+            designCompareEdit_->setPlainText(lines.join('\n'));
+        }
+
+        const QImage compensationPlot(displayOutputPath(lastRequest_.designCompensationPlotOutputPath));
+        if (compensationViewer_) {
+            if (!compensationPlot.isNull()) {
+                compensationViewer_->setImage(compensationPlot);
+            } else {
+                compensationViewer_->clearImage();
+            }
+        }
+        if (pointCloudViewer_) {
+            const QString pointCloudCsvPath =
+                lastRequest_.design3dErrorCsvOutputPath.empty()
+                    ? QString()
+                    : displayOutputPath(lastRequest_.design3dErrorCsvOutputPath);
+            QString pointCloudMessage;
+            if (!pointCloudCsvPath.isEmpty() &&
+                pointCloudViewer_->loadDesignErrorCsv(pointCloudCsvPath, &pointCloudMessage)) {
+                if (!pointCloudMessage.isEmpty()) {
+                    appendLog(QStringLiteral("[信息] %1").arg(pointCloudMessage));
+                }
+            } else {
+                pointCloudViewer_->clearCloud(
+                    pointCloudCsvPath.isEmpty()
+                        ? QStringLiteral("本次局部槽运行未生成三维误差坐标CSV。")
+                        : QStringLiteral("局部槽结果保持统一截面补偿图；当前CSV未形成可交互CAD XYZ点云。"));
+            }
+        }
+        if (compensationSummaryEdit_) {
+            const QString featureCsv = readUtf8TextFile(lastRequest_.designFeatureCompensationCsvOutputPath);
+            const QString coordinateCsv =
+                QDir::toNativeSeparators(QFileInfo(displayOutputPath(lastRequest_.designCompensationPlotOutputPath))
+                                             .dir()
+                                             .filePath(QStringLiteral("compensated_slot_edge_points.csv")));
+            QStringList lines;
+            lines << QStringLiteral("模块 6 补偿结算：局部槽特征检测");
+            lines << QString();
+            lines << QStringLiteral("补偿输出：检测槽边缘曲线、补偿后槽边缘曲线，以及补偿后实际槽边缘点坐标 CSV。");
+            lines << QStringLiteral("CAD坐标输出：若已导入 CAD，CSV 中 `compensated_cad_x/y/z_mm` 为 CAD 坐标系下补偿后的绝对 XYZ 坐标。");
+            lines << localExceedanceSummary;
+            lines << QStringLiteral("补偿图：%1").arg(displayOutputPath(lastRequest_.designCompensationPlotOutputPath));
+            lines << QStringLiteral("补偿 CSV：%1").arg(displayOutputPath(lastRequest_.designCompensationCsvOutputPath));
+            lines << QStringLiteral("补偿后槽边缘点 CSV：%1").arg(coordinateCsv);
+            lines << QString();
+            lines << QStringLiteral("槽宽与补偿预览");
+            lines << QStringLiteral("----------------------------------------");
+            lines << (featureCsv.trimmed().isEmpty() ? QStringLiteral("未生成槽特征补偿 CSV。") : featureCsv.trimmed());
+            compensationSummaryEdit_->setPlainText(lines.join('\n'));
+        }
+
+        QStringList summaryLines;
+        summaryLines << QStringLiteral("第三方复检总览");
+        summaryLines << QString();
+        summaryLines << QStringLiteral("运行模式：局部槽特征检测");
+        summaryLines << QStringLiteral("运行结果：%1").arg(ok ? QStringLiteral("成功") : QStringLiteral("失败"));
+        summaryLines << QStringLiteral("已加载图像：%1").arg(loadedImageCount);
+        summaryLines << QStringLiteral("已预处理图像：%1").arg(preprocessedImageCount);
+        summaryLines << QStringLiteral("槽底标定宽度：%1 mm").arg(lastRequest_.pipelineConfig.localSlotBottomWidthMm, 0, 'f', 4);
+        summaryLines << QStringLiteral("像素当量修正：%1 倍").arg(lastRequest_.pipelineConfig.localSlotPixelSizeScale, 0, 'f', 4);
+        if (!lastRequest_.resultOutputDir.empty()) {
+            summaryLines << QStringLiteral("结果目录：%1")
+                                .arg(QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.resultOutputDir)));
+        }
+        if (!message.isEmpty()) {
+            summaryLines << QStringLiteral("运行消息：%1").arg(message);
+        }
+        summaryLines << QStringLiteral("模型配准自动判断：单张局部槽图，无需拼接；已按槽底特征点建立统一截面对齐。");
+        summaryLines << QStringLiteral("特征提取图：%1").arg(displayOutputPath(lastRequest_.contourOverlayOutputPath));
+        summaryLines << QStringLiteral("误差分析图：%1").arg(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+        summaryLines << QStringLiteral("补偿结算图：%1").arg(displayOutputPath(lastRequest_.designCompensationPlotOutputPath));
+        summaryLines << localExceedanceSummary;
+        summaryEdit_->setPlainText(summaryLines.join('\n'));
+
+        const QString compensationCsvText = readUtf8TextFile(lastRequest_.designCompensationCsvOutputPath);
+        const QString contourCsvText = readUtf8TextFile(lastRequest_.contourPointsCsvOutputPath);
+        const QString reviewCsvText = readUtf8TextFile(lastRequest_.qualityReviewCsvOutputPath);
+        const QString featureCsvText = readUtf8TextFile(lastRequest_.designFeatureCompensationCsvOutputPath);
+        const bool cadReady =
+            activeCadModelDocument_.valid ||
+            (lastRequest_.pipelineConfig.designUseExternalProfile &&
+             lastRequest_.pipelineConfig.designExternalProfileSamples.size() >= 2);
+        const bool targetReady = lastRequest_.pipelineConfig.localSlotBottomWidthMm > 0.0;
+        const bool contourReady = !contourPlot.isNull() && !contourCsvText.trimmed().isEmpty();
+        const bool errorReady = !designPlot.isNull() &&
+                                !summaryCsv.trimmed().isEmpty() &&
+                                !profileCsv.trimmed().isEmpty();
+        const bool compensationReady = !compensationPlot.isNull() &&
+                                       compensationCsvText.contains(QStringLiteral("compensated_target_r_mm"));
+        const bool cadCompensationReady =
+            compensationCsvText.contains(QStringLiteral("compensated_cad_x_mm")) &&
+            compensationCsvText.contains(QStringLiteral("compensated_cad_y_mm")) &&
+            compensationCsvText.contains(QStringLiteral("compensated_cad_z_mm")) &&
+            compensationCsvText.contains(QRegularExpression(QStringLiteral("\\n(?:[^,\\n]*,){6}1,")));
+
+        QStringList acceptanceLines;
+        acceptanceLines << QStringLiteral("第三方验收功能对齐 - 局部槽特征检测");
+        acceptanceLines << QStringLiteral("说明：当前补偿图保持统一截面槽边缘曲线；CSV 同时输出 CAD 坐标系下补偿后 XYZ。");
+        acceptanceLines << QString();
+        acceptanceLines << QStringLiteral("| 表9测试要点 | 状态 | GUI入口/证据 |");
+        acceptanceLines << QStringLiteral("|---|---|---|");
+        acceptanceLines << QStringLiteral("| 数据接收与预处理(1) 导入CAD模型和目标尺寸 | %1 | 模块1 CAD/目标尺寸；CAD=%2；目标槽底宽度=%3 mm |")
+                               .arg(cadReady && targetReady ? QStringLiteral("通过") : QStringLiteral("待补充"),
+                                    cadReady ? QStringLiteral("已导入并生成CAD截面采样") : QStringLiteral("未导入"),
+                                    QString::number(lastRequest_.pipelineConfig.localSlotBottomWidthMm, 'f', 4));
+        acceptanceLines << QStringLiteral("| 数据接收与预处理(2) 采集或导入在线测量数据 | %1 | 模块2；图像=%2张；局部槽输入图=%3 |")
+                               .arg(loadedImageCount > 0 ? QStringLiteral("通过") : QStringLiteral("待运行"),
+                                    QString::number(loadedImageCount),
+                                    displayOutputPath(lastRequest_.panoramaOutputPath));
+        acceptanceLines << QStringLiteral("| 数据接收与预处理(3) 读取/显示/坐标转换/滤波 | %1 | 模块2-3；二值化/骨架边缘/离群过滤已执行；轮廓点CSV=%2；质量审查=%3 |")
+                               .arg(preprocessedImageCount > 0 && !reviewCsvText.trimmed().isEmpty()
+                                        ? QStringLiteral("通过")
+                                        : QStringLiteral("待运行"),
+                                    displayOutputPath(lastRequest_.contourPointsCsvOutputPath),
+                                    displayOutputPath(lastRequest_.qualityReviewCsvOutputPath));
+        acceptanceLines << QStringLiteral("| 模型配准与特征提取(1) 实测数据与数字化模型对齐 | %1 | 模块4/5；单张局部槽无需拼接，按槽底特征点建立统一截面对齐；CAD XYZ映射见 design_3d_error_points.csv |")
+                               .arg(ok && errorReady ? QStringLiteral("通过") : QStringLiteral("待运行"));
+        acceptanceLines << QStringLiteral("| 模型配准与特征提取(2) 提取槽宽、槽边和轮廓边界 | %1 | 模块3；单槽轮廓图=%2；槽特征CSV=%3 |")
+                               .arg(contourReady && !featureCsvText.trimmed().isEmpty()
+                                        ? QStringLiteral("通过")
+                                        : QStringLiteral("待运行"),
+                                    displayOutputPath(lastRequest_.contourOverlayOutputPath),
+                                    displayOutputPath(lastRequest_.designFeatureCompensationCsvOutputPath));
+        acceptanceLines << QStringLiteral("| 模型配准与特征提取(3) 记录特征参数、配准结果和可视化 | %1 | 模块3-5；误差分析图=%2；轮廓点/匹配点CSV=%3 |")
+                               .arg(errorReady ? QStringLiteral("通过") : QStringLiteral("待运行"),
+                                    displayOutputPath(lastRequest_.designComparisonOverlayOutputPath),
+                                    displayOutputPath(lastRequest_.designErrorProfileCsvOutputPath));
+        acceptanceLines << QStringLiteral("| 误差分析与补偿解算(1) 槽宽偏差、轮廓位置偏差和局部超差 | %1 | 模块5；局部超差=%2点，阈值±%3um；误差图=%4；误差明细=%5 |")
+                               .arg(errorReady ? QStringLiteral("通过") : QStringLiteral("待运行"),
+                                    localExceedanceCount,
+                                    localExceedanceThreshold,
+                                    displayOutputPath(lastRequest_.designComparisonOverlayOutputPath),
+                                    displayOutputPath(lastRequest_.designErrorProfileCsvOutputPath));
+        acceptanceLines << QStringLiteral("| 误差分析与补偿解算(2) 在工件模型坐标系下给出补偿量 | %1 | 模块6；补偿图=%2；补偿CSV=%3；补偿后XYZ字段=compensated_cad_x/y/z_mm；CAD补偿点=%4 |")
+                               .arg(compensationReady && cadCompensationReady ? QStringLiteral("通过") : QStringLiteral("待补充"),
+                                    displayOutputPath(lastRequest_.designCompensationPlotOutputPath),
+                                    displayOutputPath(lastRequest_.designCompensationCsvOutputPath),
+                                    cadCompensationReady ? QStringLiteral("已生成") : QStringLiteral("未生成"));
+        setAcceptanceText(acceptanceLines.join('\n'));
+
+        resetReportMetricCards();
+        if (metricLoadedImagesValue_) {
+            metricLoadedImagesValue_->setText(QString::number(std::max(loadedImageCount, 0)));
+        }
+        if (metricPreprocessedImagesValue_) {
+            metricPreprocessedImagesValue_->setText(QString::number(std::max(preprocessedImageCount, 0)));
+        }
+        if (metricStepCountValue_) {
+            metricStepCountValue_->setText(QStringLiteral("0"));
+        }
+        if (metricFlaggedStepsValue_) {
+            metricFlaggedStepsValue_->setText(QStringLiteral("0"));
+        }
+        if (metricDesignUsedCountValue_) {
+            const QHash<QString, QString> metrics = parseMetricCsvByKey(csvEdit_->toPlainText());
+            const QString usedPoints = metricValue(metrics, QStringLiteral("used_edge_points"), QStringLiteral("count"));
+            metricDesignUsedCountValue_->setText(usedPoints.isEmpty() ? QStringLiteral("0") : usedPoints);
+        }
+        refreshRegistrationToolState();
+        refreshReportExportState(ok ? QStringLiteral("局部槽结果已生成，CSV 和图像均保存在结果目录。")
+                                    : QStringLiteral("局部槽检测失败，请检查日志和输入图像。"));
+        refreshStageSummaries();
+        switchToStage(ReportStage);
+        return;
+    }
+
     csvEdit_->setPlainText(csvText);
     if (qualityReviewEdit_) {
         const QString reviewText = readUtf8TextFile(lastRequest_.qualityReviewCsvOutputPath);
@@ -1708,19 +2823,21 @@ void MainWindow::onRunFinished(bool ok,
     refreshPublicationFigurePreview();
 
     QStringList summaryLines;
-    summaryLines << QStringLiteral("实验结果摘要");
+    summaryLines << QStringLiteral("第三方复检总览");
     summaryLines << QString();
     summaryLines << QStringLiteral("运行模式：%1").arg(runModeLabel(currentRunMode_));
     summaryLines << QStringLiteral("运行结果：%1").arg(ok ? QStringLiteral("成功") : QStringLiteral("失败"));
     summaryLines << QStringLiteral("已加载图像：%1").arg(loadedImageCount);
     summaryLines << QStringLiteral("已预处理图像：%1").arg(preprocessedImageCount);
+    summaryLines << QStringLiteral("模型配准自动判断：%1")
+                         .arg(loadedImageCount <= 1
+                                  ? QStringLiteral("单张图像，无需拼接，直接展示轮廓并进入 CAD 对齐")
+                                  : QStringLiteral("多张图像，已执行/准备执行拼接配准"));
     if (!lastRequest_.resultOutputDir.empty()) {
         summaryLines << QStringLiteral("结果目录：%1")
                             .arg(QDir::toNativeSeparators(fromUtf8StdString(lastRequest_.resultOutputDir)));
     }
-    if (!completedSteps_.empty()) {
-        summaryLines << QStringLiteral("拼接步数：%1").arg(completedSteps_.size());
-    }
+    summaryLines << QStringLiteral("拼接步数：%1").arg(completedSteps_.size());
     if (!message.isEmpty()) {
         summaryLines << QStringLiteral("运行消息：%1").arg(message);
     }
@@ -1743,7 +2860,8 @@ void MainWindow::onRunFinished(bool ok,
         }
     }
 
-    if (runCache_ && runCache_->hasPreprocessedEdges() && runCache_->hasStitching()) {
+    const bool designComparisonEnabled = lastRequest_.pipelineConfig.enableDesignComparison;
+    if (runCache_ && runCache_->hasPreprocessedEdges() && runCache_->hasStitching() && designComparisonEnabled) {
         designAlignmentResult = pinjie::cad_design::compareMeasuredProfileToDesign(
             runCache_->preprocessedEdges,
             runCache_->stitching.imageTransforms,
@@ -1752,7 +2870,11 @@ void MainWindow::onRunFinished(bool ok,
             designSummaryPtr = &designAlignmentResult.summary;
             designCompareLines << QStringLiteral("设计母线比对结果");
             designCompareLines << QString();
-            designCompareLines << QStringLiteral("reverse_z：%1").arg(designSummaryPtr->designReverseZ ? 1 : 0);
+            designCompareLines << QStringLiteral("设计来源：%1（%2，%3 点）")
+                                      .arg(fromUtf8StdString(designSummaryPtr->designProfileMetadata.sourceType),
+                                           fromUtf8StdString(designSummaryPtr->designProfileMetadata.sourceName))
+                                      .arg(static_cast<qulonglong>(designSummaryPtr->designProfileMetadata.sampleCount));
+            designCompareLines << QStringLiteral("CAD 轴向反向展开：%1").arg(designSummaryPtr->designReverseAxial ? QStringLiteral("是") : QStringLiteral("否"));
             designCompareLines << QStringLiteral("dz：%1 mm").arg(formatMetric(designSummaryPtr->dzMm, 4));
             designCompareLines << QStringLiteral("dr：%1 mm").arg(formatMetric(designSummaryPtr->drMm, 4));
             designCompareLines << QStringLiteral("左端锚点：(%1, %2) px")
@@ -1775,6 +2897,10 @@ void MainWindow::onRunFinished(bool ok,
                                       .arg(formatMetric(designSummaryPtr->profileStats.p95AbsUm, 3));
             designCompareLines << QStringLiteral("轮廓度 PV：%1 um")
                                       .arg(formatMetric(designSummaryPtr->profileStats.pvUm, 3));
+            if (!lastRequest_.designComparisonOverlayOutputPath.empty()) {
+                designCompareLines << QStringLiteral("误差分析图：%1")
+                                      .arg(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+            }
             designCompareLines << QString();
             designCompareLines << QStringLiteral("CSV 预览");
             designCompareLines << QStringLiteral("----------------------------------------");
@@ -1795,6 +2921,14 @@ void MainWindow::onRunFinished(bool ok,
                                  .arg(formatMetric(designSummaryPtr->profileStats.p95AbsUm, 3));
             summaryLines << QStringLiteral("轮廓度 PV：%1 um")
                                  .arg(formatMetric(designSummaryPtr->profileStats.pvUm, 3));
+            if (!lastRequest_.designComparisonOverlayOutputPath.empty()) {
+                summaryLines << QStringLiteral("误差分析图：%1")
+                                .arg(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+            }
+            if (!lastRequest_.design3dErrorCsvOutputPath.empty()) {
+                summaryLines << QStringLiteral("三维误差坐标 CSV：%1")
+                                .arg(displayOutputPath(lastRequest_.design3dErrorCsvOutputPath));
+            }
             if (!readUtf8TextFile(lastRequest_.qualityReviewCsvOutputPath).trimmed().isEmpty()) {
                 summaryLines << QStringLiteral("自动质量审查：详见“质量审查”页签");
             }
@@ -1803,20 +2937,198 @@ void MainWindow::onRunFinished(bool ok,
                 designCompareEdit_->setPlainText(designCompareLines.join('\n'));
             }
             if (designCompareViewer_) {
-                designCompareViewer_->setImage(
-                    cvMatToQImage(pinjie::cad_design::buildDesignComparisonPlot(designAlignmentResult)));
+                QImage designComparisonPlot;
+                if (!lastRequest_.designComparisonOverlayOutputPath.empty()) {
+                    designComparisonPlot.load(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+                }
+                if (!designComparisonPlot.isNull()) {
+                    designCompareViewer_->setImage(designComparisonPlot);
+                } else {
+                    designCompareViewer_->clearImage();
+                    if (!lastRequest_.designComparisonOverlayOutputPath.empty()) {
+                        appendLog(QStringLiteral("[警告] 误差分析图未能加载：%1")
+                                      .arg(displayOutputPath(lastRequest_.designComparisonOverlayOutputPath)));
+                    }
+                }
+            }
+            if (processingPreviewViewer_) {
+                QImage contourPreview;
+                if (!lastRequest_.contourOverlayOutputPath.empty()) {
+                    contourPreview.load(displayOutputPath(lastRequest_.contourOverlayOutputPath));
+                }
+                if (!contourPreview.isNull()) {
+                    processingPreviewViewer_->setImage(contourPreview);
+                    if (processingPreviewInfoEdit_) {
+                        processingPreviewInfoEdit_->setPlainText(
+                            QStringLiteral("模块 3 特征提取：已显示槽类特征 ROI/轮廓提取图。\n输出图：%1")
+                                .arg(displayOutputPath(lastRequest_.contourOverlayOutputPath)));
+                    }
+                } else if (!lastRequest_.contourOverlayOutputPath.empty()) {
+                        appendLog(QStringLiteral("[警告] 特征提取轮廓图未能加载：%1")
+                                  .arg(displayOutputPath(lastRequest_.contourOverlayOutputPath)));
+                }
+                if (singleSlotViewer_) {
+                    if (!contourPreview.isNull()) {
+                        singleSlotViewer_->setImage(contourPreview);
+                    } else {
+                        singleSlotViewer_->clearImage();
+                    }
+                }
+            }
+            if (compensationViewer_) {
+                QImage compensationPlot;
+                if (!lastRequest_.designCompensationPlotOutputPath.empty()) {
+                    compensationPlot.load(displayOutputPath(lastRequest_.designCompensationPlotOutputPath));
+                }
+                if (!compensationPlot.isNull()) {
+                    compensationViewer_->setImage(compensationPlot);
+                } else {
+                    compensationViewer_->clearImage();
+                    if (!lastRequest_.designCompensationPlotOutputPath.empty()) {
+                        appendLog(QStringLiteral("[警告] 补偿结算图未能加载：%1")
+                                      .arg(displayOutputPath(lastRequest_.designCompensationPlotOutputPath)));
+                    }
+                }
+            }
+            if (pointCloudViewer_) {
+                const QString pointCloudCsvPath =
+                    lastRequest_.design3dErrorCsvOutputPath.empty()
+                        ? QString()
+                        : displayOutputPath(lastRequest_.design3dErrorCsvOutputPath);
+                QString pointCloudMessage;
+                if (!pointCloudCsvPath.isEmpty() &&
+                    pointCloudViewer_->loadDesignErrorCsv(pointCloudCsvPath, &pointCloudMessage)) {
+                    if (!pointCloudMessage.isEmpty()) {
+                        appendLog(QStringLiteral("[信息] %1").arg(pointCloudMessage));
+                    }
+                } else {
+                    pointCloudViewer_->clearCloud(
+                        pointCloudCsvPath.isEmpty()
+                            ? QStringLiteral("本次运行未生成三维误差坐标CSV，无法显示交互3D点云。")
+                            : QStringLiteral("未能加载交互3D点云，请检查三维误差坐标CSV。"));
+                    if (!pointCloudCsvPath.isEmpty()) {
+                        appendLog(QStringLiteral("[警告] 交互3D点云未能加载：%1%2")
+                                      .arg(pointCloudCsvPath,
+                                           pointCloudMessage.isEmpty()
+                                               ? QString()
+                                               : QStringLiteral("；%1").arg(pointCloudMessage)));
+                    }
+                }
+            }
+            if (compensationSummaryEdit_) {
+                const std::size_t cadCompensationRows =
+                    static_cast<std::size_t>(std::count_if(designAlignmentResult.profilePoints.begin(),
+                                                           designAlignmentResult.profilePoints.end(),
+                                                           [](const auto& point) {
+                                                               return point.isUsed && point.hasCadCoordinates;
+                                                           }));
+                QStringList compensationLines;
+                compensationLines << QStringLiteral("模块 6 补偿解算");
+                compensationLines << QString();
+                compensationLines << QStringLiteral("点级补偿：%1 个有效 CAD 坐标补偿点 / %2 个设计比对有效点")
+                                         .arg(static_cast<qulonglong>(cadCompensationRows))
+                                         .arg(static_cast<qulonglong>(designSummaryPtr->usedCount));
+                compensationLines << QStringLiteral("CAD模型坐标：轴向 %1，径向 %2，轴向原点 %3 mm，方向系数 %4")
+                                         .arg(fromUtf8StdString(designSummaryPtr->designProfileMetadata.axialAxis),
+                                              fromUtf8StdString(designSummaryPtr->designProfileMetadata.radialAxis))
+                                         .arg(designSummaryPtr->designProfileMetadata.cadAxialOriginMm, 0, 'f', 6)
+                                         .arg(designSummaryPtr->designProfileMetadata.cadAxialDirectionSign, 0, 'f', 0);
+                compensationLines << QStringLiteral("补偿约定：CSV 中 `compensated_cad_x/y/z_mm` 为 CAD 坐标系下补偿后的绝对 XYZ 坐标。");
+                compensationLines << QStringLiteral("字段说明：`delta_x/y/z_um` 表示从实测映射点移动到该 CAD 目标坐标的补偿量。");
+                compensationLines << QString();
+                compensationLines << QStringLiteral("输出文件");
+                compensationLines << QStringLiteral("补偿量可视化 PNG：%1")
+                                         .arg(displayOutputPath(lastRequest_.designCompensationPlotOutputPath));
+                compensationLines << QStringLiteral("3D 点云 PNG：%1")
+                                         .arg(designPointCloudPngPath(lastRequest_));
+                compensationLines << QStringLiteral("CAD 点级补偿 CSV：%1")
+                                          .arg(displayOutputPath(lastRequest_.designCompensationCsvOutputPath));
+                compensationLines << QStringLiteral("三维误差坐标 CSV：%1")
+                                          .arg(displayOutputPath(lastRequest_.design3dErrorCsvOutputPath));
+                compensationLines << QStringLiteral("槽特征补偿 CSV：%1")
+                                         .arg(displayOutputPath(lastRequest_.designFeatureCompensationCsvOutputPath));
+                compensationLines << QStringLiteral("设计误差汇总 CSV：%1")
+                                         .arg(displayOutputPath(lastRequest_.designErrorSummaryCsvOutputPath));
+                compensationLines << QString();
+                compensationLines << QStringLiteral("槽特征补偿预览");
+                compensationLines << QStringLiteral("----------------------------------------");
+                const QString featureText =
+                    fromUtf8StdString(designAlignmentResult.featureCompensationCsvText).trimmed();
+                if (featureText.contains(QStringLiteral("single_slot_width_target"))) {
+                    compensationLines << QStringLiteral("单槽宽目标解算：已按输入目标槽宽输出宽度误差与补偿量。");
+                    compensationLines << QString();
+                }
+                compensationLines << (featureText.isEmpty()
+                                          ? QStringLiteral("本次运行未生成槽特征补偿。")
+                                          : featureText);
+                compensationSummaryEdit_->setPlainText(compensationLines.join('\n'));
             }
         } else {
             summaryLines << QString();
             summaryLines << QStringLiteral("设计母线比对：%1")
                                 .arg(fromUtf8StdString(designAlignmentResult.message));
             if (designCompareEdit_) {
-                designCompareEdit_->setPlainText(QStringLiteral("设计母线比对未生成。\n%1")
-                                                     .arg(fromUtf8StdString(designAlignmentResult.message)));
+                designCompareEdit_->setPlainText(
+                    QStringLiteral("正式 CAD 误差分析失败。\n%1\n\n"
+                                   "请检查：CAD 是否已导入、临时像素当量/标定是否有效、检测轮廓是否有足够点与 CAD 轮廓对齐。\n"
+                                   "该状态不会生成兜底误差图；修正配置后需要重新运行全流程或误差分析模块。")
+                        .arg(fromUtf8StdString(designAlignmentResult.message)));
             }
             if (designCompareViewer_) {
                 designCompareViewer_->clearImage();
             }
+            if (processingPreviewViewer_) {
+                QImage contourPreview;
+                if (!lastRequest_.contourOverlayOutputPath.empty()) {
+                    contourPreview.load(displayOutputPath(lastRequest_.contourOverlayOutputPath));
+                }
+                if (!contourPreview.isNull()) {
+                    processingPreviewViewer_->setImage(contourPreview);
+                    if (processingPreviewInfoEdit_) {
+                        processingPreviewInfoEdit_->setPlainText(
+                            QStringLiteral("模块 3 特征提取：已显示当前可用轮廓图；CAD 误差分析未通过。\n输出图：%1")
+                                .arg(displayOutputPath(lastRequest_.contourOverlayOutputPath)));
+                    }
+                }
+            }
+            if (compensationViewer_) {
+                compensationViewer_->clearImage();
+            }
+            if (pointCloudViewer_) {
+                pointCloudViewer_->clearCloud();
+            }
+            if (compensationSummaryEdit_) {
+                compensationSummaryEdit_->setPlainText(
+                    QStringLiteral("模块 6 补偿解算未生成 CAD 点级补偿。\n%1\n\n"
+                                   "原因：正式 CAD 对齐未通过，因此不会输出 design_compensation.csv 或补偿图。\n"
+                                   "请先在模块 1 导入 CAD 并确认三维坐标预览，再运行全流程或模块 5 误差分析。")
+                        .arg(fromUtf8StdString(designAlignmentResult.message)));
+            }
+        }
+    } else if (runCache_ && runCache_->hasPreprocessedEdges() && runCache_->hasStitching()) {
+        summaryLines << QString();
+        summaryLines << QStringLiteral("设计母线比对：本次未启用");
+        summaryLines << QStringLiteral("说明：已完成工件拼接与常规结果输出；如需误差分析和补偿解算，请先导入 CAD 后运行全流程或误差分析模块。");
+        if (designCompareEdit_) {
+            designCompareEdit_->setPlainText(
+                QStringLiteral("本次运行未启用 CAD 误差分析。\n\n"
+                               "当前结果：工件拼接与常规输出已完成。\n"
+                               "如需继续生成设计比对图、误差统计和补偿 CSV，请先在模块 1 导入可用 CAD，再运行全流程或模块 5。"));
+        }
+        if (designCompareViewer_) {
+            designCompareViewer_->clearImage();
+        }
+        if (compensationViewer_) {
+            compensationViewer_->clearImage();
+        }
+        if (pointCloudViewer_) {
+            pointCloudViewer_->clearCloud(QStringLiteral("本次未启用 CAD 误差分析，未生成三维误差点云。"));
+        }
+        if (compensationSummaryEdit_) {
+            compensationSummaryEdit_->setPlainText(
+                QStringLiteral("模块 6 补偿解算未执行。\n\n"
+                               "原因：本次运行未启用 CAD 设计基准，因此不会生成补偿图、design_compensation.csv 或三维误差坐标 CSV。\n"
+                               "若需要补偿结果，请先导入 CAD 后重新运行。"));
         }
     } else {
         if (designCompareEdit_) {
@@ -1825,13 +3137,28 @@ void MainWindow::onRunFinished(bool ok,
         if (designCompareViewer_) {
             designCompareViewer_->clearImage();
         }
+        if (compensationViewer_) {
+            compensationViewer_->clearImage();
+        }
+        if (pointCloudViewer_) {
+            pointCloudViewer_->clearCloud();
+        }
+        if (compensationSummaryEdit_) {
+            compensationSummaryEdit_->setPlainText(QStringLiteral("模块 6 补偿解算：等待拼接结果与误差分析完成。"));
+        }
     }
+
+    setAcceptanceText(buildTable9AcceptanceText(ok,
+                                                loadedImageCount,
+                                                preprocessedImageCount,
+                                                designAlignmentResult.ok ? &designAlignmentResult : nullptr,
+                                                designSummaryPtr));
 
     summaryEdit_->setPlainText(summaryLines.join('\n'));
     bottomTabs_->setCurrentWidget(summaryEdit_);
     updateReportMetricCards(loadedImageCount, preprocessedImageCount, qualitySummaryPtr, designSummaryPtr);
     refreshRegistrationToolState();
-    refreshReportExportState(ok ? QStringLiteral("归档状态：结果数据已就绪，请选择需要归档的 CSV 类型。")
+    refreshReportExportState(ok ? QStringLiteral("归档状态：结果数据已就绪；误差分析与补偿解算证据已分别写入结果目录。")
                                 : QStringLiteral("归档状态：运行失败，请先检查日志，再决定是否导出 CSV。"));
     refreshStageSummaries();
 
@@ -1879,13 +3206,24 @@ void MainWindow::setUiRunning(bool running)
     if (calibrationPanel_) {
         calibrationPanel_->setRunning(running);
     }
+    if (designModelPanel_) {
+        designModelPanel_->setRunning(running);
+    }
     configPanel_->setRunning(running);
+    const bool standardCircleMode = configPanel_ && configPanel_->standardCircleModeEnabled();
+    pinjie::StitchRunRequest previewRequest;
+    QString previewError;
+    const bool syntheticInput =
+        configPanel_ && configPanel_->buildRequest(previewRequest, previewError, false) &&
+        isSingleSlotTestInput(previewRequest);
+    const bool localSlotImageMode = hasLocalSlotImageMode();
+    const bool canRun = hasMeasurementBaseline() || standardCircleMode || syntheticInput || localSlotImageMode;
     if (startButton_) {
-        startButton_->setEnabled(!running && hasActiveCalibration());
+        startButton_->setEnabled(!running && canRun);
     }
     if (moduleRunButton_) {
         const int currentStage = stageStack_ ? stageStack_->currentIndex() : CalibrationStage;
-        moduleRunButton_->setEnabled(!running && (currentStage == CalibrationStage || hasActiveCalibration()));
+        moduleRunButton_->setEnabled(!running && (currentStage == CalibrationStage || canRun));
     }
     if (stopButton_) {
         stopButton_->setEnabled(running && currentTaskSupportsStop_);
@@ -1909,6 +3247,7 @@ void MainWindow::cleanupWorker()
     setUiRunning(false);
     refreshReportExportState();
     refreshCalibrationDetailPane();
+    refreshDesignModelDetailPane();
     refreshRegistrationToolState();
     refreshStageSummaries();
 }
@@ -1988,28 +3327,58 @@ void MainWindow::refreshStageSummaries()
     QString calibrationError;
     const bool calibrationConfigValid = calibrationPanel_ && calibrationPanel_->buildRequest(calibrationRequest, calibrationError);
 
+    pinjie::cad_model::DesignModelRequest designRequest;
+    QString designError;
+    const bool designConfigValid = designModelPanel_ && designModelPanel_->buildRequest(designRequest, designError);
+
     pinjie::StitchRunRequest request;
     QString errorMessage;
     const bool valid = configPanel_->buildRequest(request, errorMessage, false);
     const bool standardCircleMode = valid && isStandardCircleMode(request);
+    double temporaryPixelSizeMm =
+        activeCadModelDocument_.valid && designConfigValid ? designRequest.temporaryPixelSizeMm
+                                                           : lastDesignModelRequest_.temporaryPixelSizeMm;
+    if (valid) {
+        const double testPixelSizeMm = singleSlotTestPixelSizeMm(request);
+        if (testPixelSizeMm > 0.0) {
+            temporaryPixelSizeMm = testPixelSizeMm;
+        }
+    }
+    const bool temporaryPixelSizeMode = activeCadModelDocument_.valid && temporaryPixelSizeMm > 0.0;
+    const bool localSlotImageMode = designConfigValid && designRequest.localSlotImageMode;
 
-    if (!hasActiveCalibration() && !standardCircleMode) {
-        workflowStateLabel_->setText(QStringLiteral("流程：未加载标定结果，请先完成阶段 1 或加载缓存模型。"));
+    if (!hasActiveCalibration() && !standardCircleMode && !temporaryPixelSizeMode && !localSlotImageMode) {
+        workflowStateLabel_->setText(QStringLiteral("复检流程：未加载标定结果；如仅测试 CAD/图片链路，可在模块 1 填写临时像素当量后导入 CAD。"));
         registrationPresetLabel_->setText(calibrationConfigValid
                                               ? QStringLiteral("标定：参数已就绪")
                                               : QStringLiteral("标定：参数缺失"));
+    } else if (localSlotImageMode) {
+        workflowStateLabel_->setText(
+            valid ? QStringLiteral("复检流程：局部槽特征检测 | %1 张图像 | 槽底宽度 %2 mm 标定")
+                        .arg(request.imagePaths.size())
+                        .arg(designRequest.localSlotBottomWidthMm, 0, 'f', 4)
+                  : QStringLiteral("复检流程：局部槽特征检测 | 运行配置待补充"));
+        registrationPresetLabel_->setText(QStringLiteral("局部槽：二值化 + 骨架边缘 + 特征点对齐 + 补偿输出"));
     } else if (standardCircleMode && !hasActiveCalibration()) {
         workflowStateLabel_->setText(
-            valid ? QStringLiteral("流程：标准圆国标检测模式 | %1 张图像待检测 | 无需预先标定")
+            valid ? QStringLiteral("复检流程：标准圆国标检测模式 | %1 张图像待检测 | 无需预先标定")
                         .arg(request.imagePaths.size())
-                  : QStringLiteral("流程：标准圆国标检测模式 | 运行配置待补充"));
+                  : QStringLiteral("复检流程：标准圆国标检测模式 | 运行配置待补充"));
         registrationPresetLabel_->setText(QStringLiteral("标准圆：掩模板预处理 + 拼接修正 + 椭圆修正 + GB/T 25窗选点"));
+    } else if (temporaryPixelSizeMode && !hasActiveCalibration()) {
+        workflowStateLabel_->setText(
+            valid ? QStringLiteral("复检流程：临时像素当量测试模式 | %1 张图像可预处理/配准")
+                        .arg(request.imagePaths.size())
+                  : QStringLiteral("复检流程：临时像素当量测试模式 | 运行配置待补充"));
+        registrationPresetLabel_->setText(
+            QStringLiteral("临时像素当量：%1 mm/px；正式检测请加载真实标定")
+                .arg(temporaryPixelSizeMm, 0, 'f', 9));
     } else {
         workflowStateLabel_->setText(
-            valid ? QStringLiteral("流程：%1 | %2 张图像可拼接")
+            valid ? QStringLiteral("复检流程：%1 | %2 张图像可拼接")
                         .arg(calibrationIdentityLine(activeCalibrationCache_))
                         .arg(request.imagePaths.size())
-                  : QStringLiteral("流程：%1 | 运行配置待补充")
+                  : QStringLiteral("复检流程：%1 | 运行配置待补充")
                         .arg(calibrationIdentityLine(activeCalibrationCache_)));
         registrationPresetLabel_->setText(QStringLiteral("标定：%1").arg(calibrationQualityLine(activeCalibrationCache_)));
     }
@@ -2018,7 +3387,8 @@ void MainWindow::refreshStageSummaries()
         calibrationOverviewEdit_->setPlainText(QStringLiteral("配置检查：未通过\n原因：%1").arg(calibrationError));
     } else {
         QStringList calibrationLines;
-        calibrationLines << QStringLiteral("配置检查：已就绪");
+        calibrationLines << QStringLiteral("模块 1 CAD/目标尺寸：量值标定配置已就绪");
+        calibrationLines << QStringLiteral("表9对应：数据接收与预处理(1)(3)，为目标尺寸导入、坐标转换和滤波提供量值基准。");
         calibrationLines << QString();
         calibrationLines << QStringLiteral("标定会话：%1").arg(fromUtf8StdString(calibrationRequest.sessionName));
         calibrationLines << QStringLiteral("图像目录：%1")
@@ -2044,22 +3414,66 @@ void MainWindow::refreshStageSummaries()
         calibrationOverviewEdit_->setPlainText(calibrationLines.join('\n'));
     }
 
+    if (!designConfigValid) {
+        designModelOverviewEdit_->setPlainText(QStringLiteral("配置检查：未通过\n原因：%1").arg(designError));
+    } else {
+        QStringList designLines;
+        designLines << QStringLiteral("模块 1 CAD/目标尺寸：CAD基准配置已就绪");
+        designLines << QStringLiteral("表9对应：数据接收与预处理(1)，导入典型槽类 CAD 模型和目标尺寸。");
+        designLines << QString();
+        designLines << QStringLiteral("CAD 文件：%1")
+                           .arg(QDir::toNativeSeparators(fromUtf8StdString(designRequest.cadFilePath)));
+        designLines << QStringLiteral("模型名称：%1")
+                           .arg(designRequest.modelName.empty()
+                                    ? QStringLiteral("未命名")
+                                    : fromUtf8StdString(designRequest.modelName));
+        designLines << QStringLiteral("工件坐标：轴向 %1，径向 %2")
+                           .arg(fromUtf8StdString(designRequest.axialAxis))
+                           .arg(fromUtf8StdString(designRequest.radialAxis));
+        designLines << QStringLiteral("CAD 轴向展开：%1")
+                           .arg(designRequest.reverseAxialDirection ? QStringLiteral("反向展开")
+                                                                    : QStringLiteral("正向展开（默认）"));
+        designLines << QStringLiteral("左端点原点：%1")
+                           .arg(designRequest.useLeftEndpointAsOrigin ? QStringLiteral("启用") : QStringLiteral("关闭"));
+        designLines << QStringLiteral("上包络母线：%1")
+                           .arg(designRequest.extractUpperEnvelope ? QStringLiteral("启用") : QStringLiteral("关闭"));
+        designLines << QStringLiteral("截面采样步长：%1 mm").arg(designRequest.profileSamplingStepMm, 0, 'f', 3);
+        if (designRequest.targetSlotWidthMm > 0.0) {
+            designLines << QStringLiteral("目标槽宽：%1 mm").arg(designRequest.targetSlotWidthMm, 0, 'f', 4);
+        }
+        if (designRequest.targetSlotDepthMm > 0.0) {
+            designLines << QStringLiteral("目标槽深：%1 mm").arg(designRequest.targetSlotDepthMm, 0, 'f', 4);
+        }
+        designLines << QStringLiteral("导入状态：%1")
+                           .arg(activeCadModelDocument_.valid
+                                     ? QStringLiteral("已加载 %1，真实截面 %2 点，比对轮廓 %3 点")
+                                           .arg(fromUtf8StdString(activeCadModelDocument_.fileName))
+                                           .arg(static_cast<qulonglong>(activeCadModelDocument_.sectionSamples.size()))
+                                           .arg(static_cast<qulonglong>(activeCadModelDocument_.profileSamples.size()))
+                                     : QStringLiteral("待导入"));
+        designModelOverviewEdit_->setPlainText(designLines.join('\n'));
+    }
+
     if (!valid) {
-        acquisitionOverviewEdit_->setPlainText(QStringLiteral("运行配置检查：未通过\n原因：%1").arg(errorMessage));
-        processingOverviewEdit_->setPlainText(QStringLiteral("等待图像输入与预处理参数就绪。"));
-        registrationOverviewEdit_->setPlainText(QStringLiteral("等待配准参数与结果导出设置就绪。"));
+        acquisitionOverviewEdit_->setPlainText(QStringLiteral("模块 2 数据接收预处理：配置未通过\n原因：%1").arg(errorMessage));
+        processingOverviewEdit_->setPlainText(QStringLiteral("模块 3 特征提取：等待图像输入、预处理参数和轮廓提取参数就绪。"));
+        registrationOverviewEdit_->setPlainText(QStringLiteral("模块 4 模型配准：等待配准参数与结果导出设置就绪。"));
         return;
     }
 
     QStringList acquisitionLines;
-    acquisitionLines << QStringLiteral("配置检查：已就绪");
+    acquisitionLines << QStringLiteral("模块 2 数据接收预处理：配置已就绪");
+    acquisitionLines << QStringLiteral("表9对应：数据接收与预处理(2)(3)，采集/导入在线测量数据并准备读取显示。");
     acquisitionLines << QString();
     acquisitionLines << QStringLiteral("标定结果：%1")
                             .arg(standardCircleMode && !hasActiveCalibration()
                                      ? QStringLiteral("标准圆模式不需要")
                                      : (hasActiveCalibration()
                                             ? fromUtf8StdString(activeCalibrationCache_.profile.profileName)
-                                            : QStringLiteral("未加载")));
+                                            : (temporaryPixelSizeMode
+                                                   ? QStringLiteral("临时像素当量 %1 mm/px")
+                                                         .arg(temporaryPixelSizeMm, 0, 'f', 9)
+                                                   : QStringLiteral("未加载"))));
     acquisitionLines << QStringLiteral("输入图像：%1").arg(request.imagePaths.size());
     if (!request.imagePaths.empty()) {
         acquisitionLines << QStringLiteral("首张图像：%1")
@@ -2071,8 +3485,13 @@ void MainWindow::refreshStageSummaries()
 
     const auto& edge = request.edgeConfig;
     QStringList processingLines;
-    processingLines << QStringLiteral("预处理参数概览");
+    processingLines << QStringLiteral("模块 3 特征提取参数");
+    processingLines << QStringLiteral("表9对应：数据接收与预处理(3)、模型配准与特征提取(2)，输出轮廓边界、槽宽/槽位特征。");
     processingLines << QString();
+    processingLines << QStringLiteral("自动判断：%1")
+                           .arg(request.pipelineConfig.designTargetSlotWidthMm > 0.0
+                                    ? QStringLiteral("槽类特征识别，提取单槽 ROI、槽宽边界和槽底候选。")
+                                    : QStringLiteral("普通工件轮廓提取，输出整体轮廓用于后续 CAD 配准。"));
     processingLines << QStringLiteral("Canny 阈值：%1 / %2").arg(edge.cannyLow, 0, 'f', 1).arg(edge.cannyHigh, 0, 'f', 1);
     processingLines << QStringLiteral("亚像素窗口：%1").arg(edge.subpixWindow);
     processingLines << QStringLiteral("亚像素 Sigma：%1").arg(edge.subpixSigma, 0, 'f', 2);
@@ -2089,7 +3508,8 @@ void MainWindow::refreshStageSummaries()
     processingOverviewEdit_->setPlainText(processingLines.join('\n'));
 
     QStringList registrationLines;
-    registrationLines << QStringLiteral("配准参数概览");
+    registrationLines << QStringLiteral("模块 4 模型配准参数");
+    registrationLines << QStringLiteral("表9对应：模型配准与特征提取(1)(3)，完成实测数据与数字化模型对齐并记录配准结果。");
     registrationLines << QString();
     if (standardCircleMode) {
         const auto& standardCircle = request.standardCircleConfig;
@@ -2113,6 +3533,10 @@ void MainWindow::refreshStageSummaries()
         registrationLines << QStringLiteral("流程说明：调用标准圆专用检测链，不使用当前工件设计比对链。");
     } else {
         const auto& pipeline = request.pipelineConfig;
+        registrationLines << QStringLiteral("自动判断：%1")
+                                 .arg(request.imagePaths.size() <= 1
+                                          ? QStringLiteral("单张图像，无需拼接，直接展示轮廓并进入 CAD 对齐。")
+                                          : QStringLiteral("多张图像，运行拼接并输出配准候选、风险步和调试图。"));
         registrationLines << QStringLiteral("方向约束：%1").arg(directionLabel(pipeline.directionConstraint));
         registrationLines << QStringLiteral("预计重叠率：%1")
                                  .arg(pipeline.expectedOverlapRatio > 0.0
@@ -2142,6 +3566,10 @@ void MainWindow::refreshStageSummaries()
     } else if (standardCircleMode) {
         registrationLines << QString();
         registrationLines << QStringLiteral("标定状态：标准圆国标检测模式下可直接用标准圆直径做像素当量修正。");
+    } else if (temporaryPixelSizeMode) {
+        registrationLines << QString();
+        registrationLines << QStringLiteral("标定状态：使用临时像素当量 %1 mm/px；仅建议用于功能测试。")
+                                 .arg(temporaryPixelSizeMm, 0, 'f', 9);
     }
 
     registrationOverviewEdit_->setPlainText(registrationLines.join('\n'));
@@ -2237,9 +3665,601 @@ void MainWindow::refreshCalibrationDetailPane()
     calibrationDetailEdit_->setPlainText(lines.join('\n'));
 }
 
+void MainWindow::refreshDesignModelDetailPane()
+{
+    if (!designModelDetailEdit_) {
+        return;
+    }
+
+    QStringList lines;
+    lines << QStringLiteral("CAD 后端：%1")
+                 .arg(fromUtf8StdString(pinjie::cad_model::occtCadImportBackendSummary()));
+
+    pinjie::cad_model::DesignModelRequest request;
+    QString errorMessage;
+    const bool requestReady = designModelPanel_ && designModelPanel_->buildRequest(request, errorMessage);
+
+    if (!activeCadModelDocument_.valid) {
+        lines << QString();
+        lines << QStringLiteral("当前尚未导入设计模型。");
+        if (requestReady) {
+            lines << QStringLiteral("已选择文件：%1")
+                            .arg(QDir::toNativeSeparators(fromUtf8StdString(request.cadFilePath)));
+            lines << QStringLiteral("点击“导入设计模型”后，将在这里显示 STEP/STP/IGES 解析摘要、包围盒和后续截面准备信息。");
+        } else if (!errorMessage.isEmpty()) {
+            lines << QStringLiteral("当前配置未完成：%1").arg(errorMessage);
+        }
+        designModelDetailEdit_->setPlainText(lines.join('\n'));
+        return;
+    }
+
+    lines << QString();
+    lines << QStringLiteral("模型摘要");
+    lines << QStringLiteral("----------------------------------------");
+    lines << fromUtf8StdString(pinjie::cad_model::buildCadModelSummaryText(activeCadModelDocument_)).trimmed();
+    lines << QString();
+    lines << QStringLiteral("当前提取策略");
+    lines << QStringLiteral("----------------------------------------");
+    lines << QStringLiteral("轴向 / 径向：%1 / %2")
+                    .arg(fromUtf8StdString(activeCadModelDocument_.axialAxis))
+                    .arg(fromUtf8StdString(activeCadModelDocument_.radialAxis));
+    lines << QStringLiteral("CAD 轴向展开：%1")
+                    .arg(lastDesignModelRequest_.reverseAxialDirection ? QStringLiteral("反向展开")
+                                                                       : QStringLiteral("正向展开（默认）"));
+    lines << QStringLiteral("左端点原点：%1")
+                    .arg(lastDesignModelRequest_.useLeftEndpointAsOrigin ? QStringLiteral("启用")
+                                                                         : QStringLiteral("关闭"));
+    lines << QStringLiteral("上包络母线：%1")
+                    .arg(lastDesignModelRequest_.extractUpperEnvelope ? QStringLiteral("启用")
+                                                                      : QStringLiteral("关闭"));
+    lines << QStringLiteral("截面采样步长：%1 mm").arg(lastDesignModelRequest_.profileSamplingStepMm, 0, 'f', 3);
+    if (activeCadModelDocument_.hasProfileSamples) {
+        if (activeCadModelDocument_.hasSectionSamples) {
+            lines << QStringLiteral("CAD真实截面预览：%1 个原始剖切点，静态图和3D页优先显示这组点。")
+                            .arg(static_cast<qulonglong>(activeCadModelDocument_.sectionSamples.size()));
+        } else {
+            lines << QStringLiteral("CAD真实截面预览：当前模型未生成可显示的原始剖切点。");
+        }
+        lines << QStringLiteral("CAD误差比对轮廓：%1 点，s=%2~%3 mm，r=%4~%5 mm（由真实截面分箱/特征提取得到，仅用于后续误差比对）")
+                        .arg(static_cast<qulonglong>(activeCadModelDocument_.profileSamples.size()))
+                        .arg(activeCadModelDocument_.profileMinSMm, 0, 'f', 3)
+                        .arg(activeCadModelDocument_.profileMaxSMm, 0, 'f', 3)
+                        .arg(activeCadModelDocument_.profileMinRMm, 0, 'f', 3)
+                        .arg(activeCadModelDocument_.profileMaxRMm, 0, 'f', 3);
+        lines << QStringLiteral("CAD 轮廓提取：%1，截面 %2 = %3 mm")
+                        .arg(fromUtf8StdString(activeCadModelDocument_.profileMetadata.extractionMethod))
+                        .arg(fromUtf8StdString(activeCadModelDocument_.profileMetadata.sectionNormalAxis))
+                        .arg(activeCadModelDocument_.profileMetadata.sectionCoordinateMm, 0, 'f', 6);
+        lines << QStringLiteral("比对坐标换算：%1 = %2 + (%3) * s，%4 = r；预览主图按 CAD X/Y/Z 原始坐标显示")
+                        .arg(fromUtf8StdString(activeCadModelDocument_.profileMetadata.axialAxis))
+                        .arg(activeCadModelDocument_.profileMetadata.cadAxialOriginMm, 0, 'f', 6)
+                        .arg(activeCadModelDocument_.profileMetadata.cadAxialDirectionSign, 0, 'f', 0)
+                        .arg(fromUtf8StdString(activeCadModelDocument_.profileMetadata.radialAxis));
+        if (!lastCadPreviewImagePath_.isEmpty()) {
+            lines << QStringLiteral("CAD真实截面预览图：%1").arg(lastCadPreviewImagePath_);
+        }
+    } else {
+        lines << QStringLiteral("CAD 设计轮廓：未生成，运行时将回退到内置母线。");
+    }
+    if (lastDesignModelRequest_.targetSlotWidthMm > 0.0 || lastDesignModelRequest_.targetSlotDepthMm > 0.0) {
+        lines << QStringLiteral("目标槽宽 / 槽深：%1 mm / %2 mm")
+                        .arg(lastDesignModelRequest_.targetSlotWidthMm, 0, 'f', 4)
+                        .arg(lastDesignModelRequest_.targetSlotDepthMm, 0, 'f', 4);
+    } else {
+        lines << QStringLiteral("目标槽宽 / 槽深：当前未填写，将在后续特征定义阶段继续补充。");
+    }
+    if (lastDesignModelRequest_.temporaryPixelSizeMm > 0.0) {
+        lines << QStringLiteral("临时像素当量：%1 mm/px（测试覆盖模块 1 标定值）")
+                        .arg(lastDesignModelRequest_.temporaryPixelSizeMm, 0, 'f', 9);
+    } else if (hasActiveCalibration()) {
+        const double pixelSizeMm = calibrationPixelSizeMm(activeCalibrationCache_);
+        if (pixelSizeMm > 0.0) {
+            lines << QStringLiteral("设计比对像素当量：%1 mm/px（来自模块 1 标定）").arg(pixelSizeMm, 0, 'f', 9);
+        }
+    }
+    lines << QString();
+    lines << QStringLiteral("当前说明：CAD展示使用真实剖切截面；误差分析使用处理后的比对轮廓，并输出 CAD 模型 XYZ 坐标下的补偿后绝对坐标；单槽宽目标模式可用于复检一个槽宽。");
+
+    designModelDetailEdit_->setPlainText(lines.join('\n'));
+}
+
+void MainWindow::applyActiveDesignModelToRequest(pinjie::StitchRunRequest& request) const
+{
+    const bool hasProfileSamples =
+        activeCadModelDocument_.hasProfileSamples && activeCadModelDocument_.profileSamples.size() >= 2;
+    const bool hasSectionSamples =
+        activeCadModelDocument_.hasSectionSamples && activeCadModelDocument_.sectionSamples.size() >= 2;
+    if (!activeCadModelDocument_.valid || (!hasProfileSamples && !hasSectionSamples)) {
+        return;
+    }
+
+    pinjie::cad_model::DesignModelRequest currentDesignRequest = lastDesignModelRequest_;
+    QString designError;
+    if (designModelPanel_) {
+        pinjie::cad_model::DesignModelRequest panelRequest;
+        if (designModelPanel_->buildRequest(panelRequest, designError)) {
+            currentDesignRequest.targetSlotWidthMm = panelRequest.targetSlotWidthMm;
+            currentDesignRequest.targetSlotDepthMm = panelRequest.targetSlotDepthMm;
+            currentDesignRequest.temporaryPixelSizeMm = panelRequest.temporaryPixelSizeMm;
+            currentDesignRequest.localSlotImageMode = panelRequest.localSlotImageMode;
+            currentDesignRequest.localSlotBottomWidthMm = panelRequest.localSlotBottomWidthMm;
+        }
+    }
+
+    request.pipelineConfig.designUseExternalProfile = true;
+    request.pipelineConfig.designExternalProfileSamples =
+        currentDesignRequest.localSlotImageMode && hasSectionSamples
+            ? activeCadModelDocument_.sectionSamples
+            : (hasProfileSamples ? activeCadModelDocument_.profileSamples : activeCadModelDocument_.sectionSamples);
+    request.pipelineConfig.designProfileMetadata = activeCadModelDocument_.profileMetadata;
+    request.pipelineConfig.designReverseAxial = lastDesignModelRequest_.reverseAxialDirection;
+    request.pipelineConfig.designUseLeftEndpointAnchor = lastDesignModelRequest_.useLeftEndpointAsOrigin;
+    request.pipelineConfig.designAnchorRadialToLeftEndpoint = lastDesignModelRequest_.useLeftEndpointAsOrigin;
+    request.pipelineConfig.designUseUpperEnvelope = lastDesignModelRequest_.extractUpperEnvelope;
+    request.pipelineConfig.designIgnoreStepTransition = false;
+    request.pipelineConfig.designTargetSlotWidthMm = currentDesignRequest.targetSlotWidthMm;
+    request.pipelineConfig.designTargetSlotDepthMm = currentDesignRequest.targetSlotDepthMm;
+    request.pipelineConfig.localSlotImageMode = currentDesignRequest.localSlotImageMode;
+    request.pipelineConfig.localSlotBottomWidthMm = currentDesignRequest.localSlotBottomWidthMm;
+    if (request.pipelineConfig.localSlotImageMode &&
+        request.pipelineConfig.designTargetSlotWidthMm <= 0.0) {
+        request.pipelineConfig.designTargetSlotWidthMm = currentDesignRequest.localSlotBottomWidthMm;
+    }
+    request.pipelineConfig.designUseCentralSlotImageRoi = false;
+    if (currentDesignRequest.temporaryPixelSizeMm > 0.0) {
+        request.pipelineConfig.designPixelSizeMm = currentDesignRequest.temporaryPixelSizeMm;
+        request.pipelineConfig.designFilterEndFaceEdges = false;
+    }
+    const double testPixelSizeMm = singleSlotTestPixelSizeMm(request);
+    if (testPixelSizeMm > 0.0) {
+        request.pipelineConfig.designPixelSizeMm = testPixelSizeMm;
+        request.pipelineConfig.designFilterEndFaceEdges = false;
+    }
+}
+
+bool MainWindow::generateMatplotlibDesignPlots(const pinjie::StitchRunRequest& request,
+                                               const bool includeContourPreview,
+                                               QString& errorMessage,
+                                               QString* scriptOutput) const
+{
+    errorMessage.clear();
+    if (scriptOutput) {
+        scriptOutput->clear();
+    }
+    if (request.resultOutputDir.empty()) {
+        errorMessage = QStringLiteral("结果输出目录不可用。");
+        return false;
+    }
+
+    const std::filesystem::path projectRoot = pinjie::projectRootPath();
+    const std::filesystem::path scriptPath = projectRoot / "report" / "figure_export" / "gui_design_plots.py";
+    if (!std::filesystem::exists(scriptPath)) {
+        errorMessage = QStringLiteral("未找到 gui_design_plots.py。");
+        return false;
+    }
+
+    const QSize comparisonSize = preferredPlotSize(designCompareViewer_, 1480, 960);
+    const QSize compensationSize = preferredPlotSize(compensationViewer_, 1680, 1180);
+    const QSize contourSize =
+        preferredPlotSize(singleSlotViewer_, 1420, 920)
+            .expandedTo(preferredPlotSize(processingPreviewViewer_, 1420, 920));
+    const QSize pointCloudSize = preferredPlotSize(pointCloudViewer_, 1500, 980);
+    const QString resultDir = QDir::fromNativeSeparators(fromUtf8StdString(request.resultOutputDir));
+    const int dpi = 180;
+
+    const auto runPlot = [&](const QString& label,
+                             const QString& outputFlag,
+                             const QString& outputPath,
+                             const QSize& plotSize) -> bool {
+        if (outputPath.isEmpty()) {
+            return true;
+        }
+
+        QProcess process;
+        process.setWorkingDirectory(QString::fromStdString(projectRoot.u8string()));
+        process.setProgram(QStringLiteral("python"));
+
+        QStringList arguments{
+            QString::fromStdString(scriptPath.u8string()),
+            QStringLiteral("--result-dir"),
+            resultDir,
+            outputFlag,
+            outputPath,
+            QStringLiteral("--width-px"),
+            QString::number(plotSize.width()),
+            QStringLiteral("--height-px"),
+            QString::number(plotSize.height()),
+            QStringLiteral("--dpi"),
+            QString::number(dpi),
+        };
+
+        process.setArguments(arguments);
+        process.setProcessChannelMode(QProcess::MergedChannels);
+        process.start();
+        if (!process.waitForStarted(5000)) {
+            errorMessage = QStringLiteral("无法启动 Python。请确认 `python` 已加入 PATH。");
+            return false;
+        }
+
+        process.waitForFinished(-1);
+        const QString output = QString::fromUtf8(process.readAllStandardOutput()).trimmed();
+        if (scriptOutput && !output.isEmpty()) {
+            if (!scriptOutput->isEmpty()) {
+                scriptOutput->append(QStringLiteral("\n\n"));
+            }
+            scriptOutput->append(QStringLiteral("[%1]\n%2").arg(label, output));
+        }
+        if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+            errorMessage = output.isEmpty()
+                               ? QStringLiteral("%1 图表脚本执行失败。").arg(label)
+                               : QStringLiteral("%1 图表脚本执行失败：\n%2").arg(label, output);
+            return false;
+        }
+        return true;
+    };
+
+    if (!runPlot(QStringLiteral("误差分析图"),
+                 QStringLiteral("--comparison-output"),
+                 request.designComparisonOverlayOutputPath.empty()
+                     ? QString()
+                     : QDir::fromNativeSeparators(fromUtf8StdString(request.designComparisonOverlayOutputPath)),
+                 comparisonSize)) {
+        return false;
+    }
+    if (!runPlot(QStringLiteral("补偿图"),
+                 QStringLiteral("--compensation-output"),
+                 request.designCompensationPlotOutputPath.empty()
+                     ? QString()
+                     : QDir::fromNativeSeparators(fromUtf8StdString(request.designCompensationPlotOutputPath)),
+                 compensationSize)) {
+        return false;
+    }
+    if (includeContourPreview &&
+        !runPlot(QStringLiteral("单槽图"),
+                 QStringLiteral("--contour-output"),
+                 request.contourOverlayOutputPath.empty()
+                     ? QString()
+                     : QDir::fromNativeSeparators(fromUtf8StdString(request.contourOverlayOutputPath)),
+                 contourSize)) {
+        return false;
+    }
+    if (!request.design3dErrorCsvOutputPath.empty() &&
+        !runPlot(QStringLiteral("3D点云图"),
+                 QStringLiteral("--pointcloud-output"),
+                 QDir::fromNativeSeparators(designPointCloudPngPath(request)),
+                 pointCloudSize)) {
+        return false;
+    }
+    return true;
+}
+
+bool MainWindow::generateCadModelPreview(const pinjie::cad_model::CadModelDocument& document)
+{
+    lastCadPreviewImagePath_.clear();
+    if (cadPreviewViewer_) {
+        cadPreviewViewer_->clearImage();
+    }
+    const bool hasSectionPreview = document.hasSectionSamples && document.sectionSamples.size() >= 2;
+    const bool hasProfilePreview = document.hasProfileSamples && document.profileSamples.size() >= 2;
+    const bool hasMeshPreview = !hasSectionPreview && document.hasMesh && !document.meshVertices.empty();
+    const bool hasPreviewSamples = hasSectionPreview || hasProfilePreview || hasMeshPreview;
+    if (!document.valid || !hasPreviewSamples) {
+        appendLog(QStringLiteral("[警告] CAD 预览未生成：没有可绘制的 CAD 截面点。"));
+        return false;
+    }
+
+    const std::filesystem::path outputDir =
+        std::filesystem::path(PINJIE_PROJECT_ROOT) / "result" / "cad_preview";
+    std::error_code ec;
+    std::filesystem::create_directories(outputDir, ec);
+    if (ec) {
+        appendLog(QStringLiteral("[错误] CAD 预览目录创建失败：%1").arg(fromUtf8StdString(ec.message())));
+        return false;
+    }
+
+    std::string baseName;
+    if (!document.sourcePath.empty()) {
+        baseName = std::filesystem::u8path(document.sourcePath).stem().u8string();
+    }
+    if (baseName.empty()) {
+        baseName = document.modelLabel.empty() ? std::string("cad_model") : document.modelLabel;
+    }
+    for (char& ch : baseName) {
+        const bool validChar =
+            (ch >= '0' && ch <= '9') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= 'a' && ch <= 'z') ||
+            ch == '_' || ch == '-';
+        if (!validChar) {
+            ch = '_';
+        }
+    }
+
+    const std::filesystem::path csvPath = outputDir / (baseName + "_profile.csv");
+    const std::filesystem::path imagePath = outputDir / (baseName + "_profile_preview.png");
+    {
+        std::ofstream stream(csvPath, std::ios::binary);
+        if (!stream) {
+            appendLog(QStringLiteral("[错误] CAD 预览采样 CSV 写入失败：%1")
+                          .arg(QDir::toNativeSeparators(fromUtf8StdString(csvPath.u8string()))));
+            return false;
+        }
+        stream.setf(std::ios::fixed);
+        stream.precision(9);
+        stream << "index,s_mm,r_mm,has_cad_point,cad_x_mm,cad_y_mm,cad_z_mm\n";
+        std::size_t index = 0;
+        if (hasSectionPreview || hasProfilePreview) {
+            const auto& previewSamples = hasSectionPreview ? document.sectionSamples : document.profileSamples;
+            constexpr std::size_t kMaxCadPreviewRows = 120000;
+            const std::size_t previewStride =
+                previewSamples.size() > kMaxCadPreviewRows
+                    ? (previewSamples.size() + kMaxCadPreviewRows - 1) / kMaxCadPreviewRows
+                    : 1;
+            for (std::size_t sampleIndex = 0; sampleIndex < previewSamples.size(); sampleIndex += previewStride) {
+                const auto& sample = previewSamples[sampleIndex];
+                stream << (++index) << ","
+                       << sample.sMm << ","
+                       << sample.rMm << ","
+                       << (sample.hasCadPoint ? 1 : 0) << ","
+                       << sample.cadXMm << ","
+                       << sample.cadYMm << ","
+                       << sample.cadZMm << "\n";
+            }
+        } else if (hasMeshPreview) {
+            for (const auto& vertex : document.meshVertices) {
+                stream << (++index) << ","
+                       << vertex.xMm << ","
+                       << vertex.yMm << ","
+                       << 1 << ","
+                       << vertex.xMm << ","
+                       << vertex.yMm << ","
+                       << vertex.zMm << "\n";
+            }
+        }
+    }
+
+    const std::filesystem::path scriptPath =
+        std::filesystem::path(PINJIE_PROJECT_ROOT) / "report" / "figure_export" / "cad_profile_preview.py";
+    if (!std::filesystem::exists(scriptPath)) {
+        appendLog(QStringLiteral("[错误] CAD 预览脚本不存在：%1")
+                      .arg(QDir::toNativeSeparators(fromUtf8StdString(scriptPath.u8string()))));
+        return false;
+    }
+
+    QStringList args;
+    const QSize cadPreviewSize = preferredPlotSize(cadPreviewViewer_, 1500, 940);
+    args << QString::fromStdString(scriptPath.u8string())
+         << QStringLiteral("--profile-csv")
+         << QString::fromStdString(csvPath.u8string())
+         << QStringLiteral("--output")
+         << QString::fromStdString(imagePath.u8string())
+         << QStringLiteral("--title")
+         << QStringLiteral("CAD XYZ 投影预览 - %1")
+                 .arg(document.modelLabel.empty() ? fromUtf8StdString(baseName) : fromUtf8StdString(document.modelLabel))
+         << QStringLiteral("--axial-axis")
+         << fromUtf8StdString(document.profileMetadata.axialAxis)
+         << QStringLiteral("--radial-axis")
+         << fromUtf8StdString(document.profileMetadata.radialAxis)
+         << QStringLiteral("--section-axis")
+         << fromUtf8StdString(document.profileMetadata.sectionNormalAxis)
+         << QStringLiteral("--section-coordinate")
+         << QString::number(document.profileMetadata.sectionCoordinateMm, 'f', 6)
+         << QStringLiteral("--width-px")
+         << QString::number(cadPreviewSize.width())
+         << QStringLiteral("--height-px")
+         << QString::number(cadPreviewSize.height())
+         << QStringLiteral("--dpi")
+         << QStringLiteral("180");
+
+    QProcess process;
+    process.start(QStringLiteral("python"), args);
+    if (!process.waitForFinished(60000)) {
+        process.kill();
+        appendLog(QStringLiteral("[错误] CAD 预览生成超时，请检查 Python/matplotlib 环境。"));
+        return false;
+    }
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        appendLog(QStringLiteral("[错误] CAD 预览生成失败：%1")
+                      .arg(QString::fromLocal8Bit(process.readAllStandardError()).trimmed()));
+        return false;
+    }
+
+    QImage preview;
+    if (!preview.load(QString::fromStdString(imagePath.u8string())) || preview.isNull()) {
+        appendLog(QStringLiteral("[错误] CAD 预览图读取失败：%1")
+                      .arg(QDir::toNativeSeparators(fromUtf8StdString(imagePath.u8string()))));
+        return false;
+    }
+    if (cadPreviewViewer_) {
+        cadPreviewViewer_->setImage(preview);
+    }
+    lastCadPreviewImagePath_ = QDir::toNativeSeparators(QString::fromStdString(imagePath.u8string()));
+    appendLog(QStringLiteral("[信息] CAD 真实截面预览已生成：%1").arg(lastCadPreviewImagePath_));
+    return true;
+}
+
+QString MainWindow::buildInitialTable9AcceptanceText() const
+{
+    QStringList lines;
+    lines << QStringLiteral("表9 在线测量与误差补偿软件系统测试内容");
+    lines << QStringLiteral("状态：待运行；运行完成后自动填充证据文件。");
+    lines << QString();
+    lines << QStringLiteral("| 验收项 | GUI入口 | 当前暴露内容 |");
+    lines << QStringLiteral("|---|---|---|");
+    lines << QStringLiteral("| 数据接收与预处理(1) CAD模型和目标尺寸 | 模块1 CAD/目标尺寸 | STEP/STP/IGES导入、目标槽宽/槽深、真实截面预览、误差比对轮廓 |");
+    lines << QStringLiteral("| 数据接收与预处理(2) 在线测量数据 | 模块2 数据接收预处理 | 图像目录/在线采集、图像数量、结果目录 |");
+    lines << QStringLiteral("| 数据接收与预处理(3) 读取/显示/坐标转换/滤波 | 模块2-3 | 标定像素当量、预处理预览、亚像素边缘、点过滤参数 |");
+    lines << QStringLiteral("| 模型配准与特征提取(1) 实测-数字模型对齐 | 模块4 模型配准 | 重叠率、搜索范围、旋转、配准候选诊断 |");
+    lines << QStringLiteral("| 模型配准与特征提取(2) 横宽/槽位/轮廓边界 | 模块3 特征提取 | 单槽ROI、目标槽宽/槽深、轮廓边界预览 |");
+    lines << QStringLiteral("| 模型配准与特征提取(3) 参数/配准/可视化记录 | 模块4-5 | 候选诊断CSV、质量审查CSV、单槽ROI识别图 |");
+    lines << QStringLiteral("| 误差分析与补偿解算(1) 槽宽/轮廓/超差 | 模块5 误差分析 | 设计误差明细、三维误差坐标、误差统计图 |");
+    lines << QStringLiteral("| 误差分析与补偿解算(2) CAD模型坐标补偿量 | 模块6 补偿解算 | CAD点级补偿、`compensated_cad_x/y/z_mm`补偿后绝对坐标、补偿结算图 |");
+    return lines.join('\n');
+}
+
+QString MainWindow::buildTable9AcceptanceText(bool ok,
+                                              int loadedImageCount,
+                                              int preprocessedImageCount,
+                                              const pinjie::cad_design::DesignAlignmentResult* designResult,
+                                              const pinjie::cad_design::DesignErrorSummary* designSummary) const
+{
+    const auto state = [](bool pass, bool partial = false) {
+        if (pass) {
+            return QStringLiteral("通过");
+        }
+        return partial ? QStringLiteral("待补充") : QStringLiteral("待运行");
+    };
+
+    const bool cadFromDesignResult =
+        designSummary &&
+        designSummary->designProfileMetadata.sourceType == "external_cad" &&
+        designSummary->designProfileMetadata.sampleCount >= 2;
+    const bool cadImported = activeCadModelDocument_.valid || cadFromDesignResult;
+    const bool targetSizeReady =
+        lastDesignModelRequest_.targetSlotWidthMm > 0.0 ||
+        lastDesignModelRequest_.targetSlotDepthMm > 0.0 ||
+        (activeCadModelDocument_.valid && activeCadModelDocument_.hasBounds);
+    const bool dataLoaded = loadedImageCount > 0;
+    const bool dataPreprocessed = preprocessedImageCount > 0;
+    const bool modelAligned = designResult && designResult->ok && designSummary;
+    const bool featureResolved =
+        designResult && designResult->ok &&
+        (QString::fromUtf8(designResult->featureCompensationCsvText.data(),
+                           static_cast<int>(designResult->featureCompensationCsvText.size()))
+             .contains(QStringLiteral(",ok,")) ||
+         lastDesignModelRequest_.targetSlotWidthMm > 0.0);
+    const std::size_t usedDesignPointCount =
+        designResult ? static_cast<std::size_t>(std::count_if(designResult->profilePoints.begin(),
+                                                              designResult->profilePoints.end(),
+                                                              [](const auto& point) {
+                                                                  return point.isUsed;
+                                                              }))
+                     : 0;
+    const std::size_t cadCoordinateCount =
+        designResult ? static_cast<std::size_t>(std::count_if(designResult->profilePoints.begin(),
+                                                              designResult->profilePoints.end(),
+                                                              [](const auto& point) {
+                                                                  return point.isUsed && point.hasCadCoordinates;
+                                                              }))
+                     : 0;
+    const bool hasCadCoordinateCompensation =
+        modelAligned &&
+        cadCoordinateCount > 0 &&
+        cadCoordinateCount == usedDesignPointCount &&
+        !lastRequest_.designCompensationCsvOutputPath.empty() &&
+        !lastRequest_.design3dErrorCsvOutputPath.empty();
+    const bool hasErrorAnalysisEvidence =
+        modelAligned &&
+        !lastRequest_.designErrorProfileCsvOutputPath.empty() &&
+        !lastRequest_.designErrorSummaryCsvOutputPath.empty();
+    const bool hasVisualizationEvidence =
+        modelAligned &&
+        (!lastRequest_.designComparisonOverlayOutputPath.empty() ||
+         !lastRequest_.qualityReviewCsvOutputPath.empty());
+    const int riskStepCount =
+        static_cast<int>(std::count_if(completedSteps_.begin(), completedSteps_.end(), isRiskStep));
+
+    QStringList lines;
+    lines << QStringLiteral("表9 在线测量与误差补偿软件系统测试内容");
+    lines << QStringLiteral("本次运行：%1").arg(ok ? QStringLiteral("成功") : QStringLiteral("失败或未完整完成"));
+    lines << QString();
+    lines << QStringLiteral("| 表9测试要点 | 状态 | 界面入口/证据 |");
+    lines << QStringLiteral("|---|---|---|");
+    lines << QStringLiteral("| 数据接收与预处理(1) 导入CAD模型和目标尺寸 | %1 | 模块1；CAD=%2；目标尺寸=%3 |")
+                 .arg(state(cadImported && targetSizeReady, cadImported),
+                      cadImported ? QStringLiteral("已导入/已参与比对") : QStringLiteral("未导入"),
+                      targetSizeReady ? QStringLiteral("已配置或由CAD边界给出") : QStringLiteral("待填写槽宽/槽深"));
+    lines << QStringLiteral("| 数据接收与预处理(2) 采集或导入在线测量数据 | %1 | 模块2；图像=%2张；结果目录=%3 |")
+                 .arg(state(dataLoaded),
+                      QString::number(loadedImageCount),
+                      displayOutputPath(lastRequest_.resultOutputDir));
+    lines << QStringLiteral("| 数据接收与预处理(3) 读取/显示/坐标转换/滤波 | %1 | 模块2-3；预处理=%2张；标定=%3 |")
+                 .arg(state(dataPreprocessed && (hasActiveCalibration() || lastDesignModelRequest_.temporaryPixelSizeMm > 0.0),
+                            dataPreprocessed),
+                      QString::number(preprocessedImageCount),
+                      hasActiveCalibration() ? calibrationQualityLine(activeCalibrationCache_)
+                                             : QStringLiteral("未加载，或使用临时像素当量"));
+    lines << QStringLiteral("| 模型配准与特征提取(1) 实测数据与数字化模型对齐 | %1 | 模块4/5；有效比对点=%2；候选诊断=%3 |")
+                 .arg(state(modelAligned),
+                      QString::number(designSummary ? static_cast<int>(designSummary->usedCount) : 0),
+                      displayOutputPath(lastRequest_.alignmentCandidateDiagnosticsCsvOutputPath));
+    lines << QStringLiteral("| 模型配准与特征提取(2) 提取横宽/槽位/轮廓边界 | %1 | 模块3/5；槽特征=%2；单槽ROI图=%3 |")
+                 .arg(state(featureResolved, modelAligned),
+                      displayOutputPath(lastRequest_.designFeatureCompensationCsvOutputPath),
+                      displayOutputPath(lastRequest_.designComparisonOverlayOutputPath));
+    lines << QStringLiteral("| 模型配准与特征提取(3) 记录参数/配准结果/可视化 | %1 | 模块4/5；风险步=%2；质量审查=%3 |")
+                 .arg(state(hasVisualizationEvidence, modelAligned),
+                      QString::number(riskStepCount),
+                      displayOutputPath(lastRequest_.qualityReviewCsvOutputPath));
+    lines << QStringLiteral("| 误差分析与补偿解算(1) 槽宽/轮廓偏差/局部超差 | %1 | 模块5；误差明细=%2；三维误差=%3 |")
+                 .arg(state(hasErrorAnalysisEvidence, modelAligned),
+                      displayOutputPath(lastRequest_.designErrorProfileCsvOutputPath),
+                      displayOutputPath(lastRequest_.design3dErrorCsvOutputPath));
+    lines << QStringLiteral("| 误差分析与补偿解算(2) CAD模型坐标补偿量 | %1 | 模块6；CAD补偿点=%2/%3；补偿后XYZ字段=compensated_cad_x/y/z_mm；补偿CSV=%4 |")
+                 .arg(state(hasCadCoordinateCompensation, modelAligned),
+                      QString::number(static_cast<int>(cadCoordinateCount)),
+                      QString::number(static_cast<int>(usedDesignPointCount)),
+                      displayOutputPath(lastRequest_.designCompensationCsvOutputPath));
+    lines << QString();
+    lines << QStringLiteral("补偿可视化：%1").arg(displayOutputPath(lastRequest_.designCompensationPlotOutputPath));
+    return lines.join('\n');
+}
+
+void MainWindow::setAcceptanceText(const QString& text)
+{
+    if (acceptanceChecklistEdit_) {
+        acceptanceChecklistEdit_->setPlainText(text);
+    }
+    if (acceptanceOverviewEdit_) {
+        acceptanceOverviewEdit_->setPlainText(text);
+    }
+}
+
 bool MainWindow::hasActiveCalibration() const
 {
     return activeCalibrationCache_.valid && activeCalibrationCache_.profile.valid;
+}
+
+bool MainWindow::hasTemporaryDesignPixelSize() const
+{
+    if (!activeCadModelDocument_.valid) {
+        return false;
+    }
+
+    pinjie::cad_model::DesignModelRequest request;
+    QString errorMessage;
+    if (designModelPanel_ && designModelPanel_->buildRequest(request, errorMessage)) {
+        return request.temporaryPixelSizeMm > 0.0;
+    }
+    return lastDesignModelRequest_.temporaryPixelSizeMm > 0.0;
+}
+
+bool MainWindow::hasLocalSlotImageMode() const
+{
+    pinjie::cad_model::DesignModelRequest request;
+    QString errorMessage;
+    if (designModelPanel_ && designModelPanel_->buildRequest(request, errorMessage)) {
+        return request.localSlotImageMode;
+    }
+    return lastDesignModelRequest_.localSlotImageMode;
+}
+
+bool MainWindow::hasMeasurementBaseline() const
+{
+    return hasActiveCalibration() || hasTemporaryDesignPixelSize();
+}
+
+QSize MainWindow::preferredPlotSize(const QWidget* widget, const int minWidth, const int minHeight) const
+{
+    QSize size(minWidth, minHeight);
+    if (const auto* viewer = dynamic_cast<const ImageViewer*>(widget)) {
+        size = viewer->recommendedExportPixelSize();
+    } else if (widget) {
+        const QSize widgetSize = widget->size();
+        size = QSize(std::max(minWidth, widgetSize.width()),
+                     std::max(minHeight, widgetSize.height()));
+    }
+    return size.expandedTo(QSize(minWidth, minHeight));
 }
 
 void MainWindow::updateStageButtonStates(int stageIndex)
@@ -2257,7 +4277,13 @@ void MainWindow::updateWorkflowAccessState()
     const bool running = workerThread_ != nullptr;
     const int currentStage = stageStack_ ? stageStack_->currentIndex() : CalibrationStage;
     const bool standardCircleMode = configPanel_ && configPanel_->standardCircleModeEnabled();
-    const bool canRun = hasActiveCalibration() || standardCircleMode;
+    pinjie::StitchRunRequest previewRequest;
+    QString previewError;
+    const bool syntheticInput =
+        configPanel_ && configPanel_->buildRequest(previewRequest, previewError, false) &&
+        isSingleSlotTestInput(previewRequest);
+    const bool localSlotImageMode = hasLocalSlotImageMode();
+    const bool canRun = hasMeasurementBaseline() || standardCircleMode || syntheticInput || localSlotImageMode;
 
     if (startButton_) {
         startButton_->setEnabled(!running && canRun);
@@ -2282,7 +4308,7 @@ void MainWindow::updateModuleRunButtonText(int stageIndex)
     }
 
     if (stageIndex == CalibrationStage) {
-        moduleRunButton_->setText(QStringLiteral("运行标定"));
+        moduleRunButton_->setText(QStringLiteral("运行量值标定"));
         return;
     }
 
@@ -2291,12 +4317,26 @@ void MainWindow::updateModuleRunButtonText(int stageIndex)
         return;
     }
 
-    if (!hasActiveCalibration()) {
-        moduleRunButton_->setText(QStringLiteral("请先加载标定结果"));
+    pinjie::StitchRunRequest previewRequest;
+    QString previewError;
+    const bool syntheticInput =
+        configPanel_ && configPanel_->buildRequest(previewRequest, previewError, false) &&
+        isSingleSlotTestInput(previewRequest);
+
+    const bool localSlotImageMode = hasLocalSlotImageMode();
+    if (!hasMeasurementBaseline() && !syntheticInput && !localSlotImageMode) {
+        moduleRunButton_->setText(QStringLiteral("请先加载标定或填写临时像素当量"));
         return;
     }
 
-    moduleRunButton_->setText(QStringLiteral("运行%1").arg(stageTitle(stageIndex)));
+    moduleRunButton_->setText(
+        syntheticInput && !hasActiveCalibration()
+            ? QStringLiteral("运行%1模块（单槽测试像素当量）").arg(stageTitle(stageIndex))
+        : localSlotImageMode && !hasActiveCalibration() && !hasTemporaryDesignPixelSize()
+            ? QStringLiteral("运行%1模块（局部槽照片）").arg(stageTitle(stageIndex))
+        : hasTemporaryDesignPixelSize() && !hasActiveCalibration()
+            ? QStringLiteral("运行%1模块（临时像素当量）").arg(stageTitle(stageIndex))
+            : QStringLiteral("运行%1模块").arg(stageTitle(stageIndex)));
 }
 
 void MainWindow::selectStepRow(int row)
@@ -2823,11 +4863,18 @@ void MainWindow::refreshReportExportState(const QString& statusMessage)
     }
 
     const QStringList labels = selectedPaperCsvLabels(configPanel_);
+    const bool analysisMode =
+        currentRunMode_ == pinjie::StitchRunMode::Full ||
+        currentRunMode_ == pinjie::StitchRunMode::Report;
+    const QString workpieceAutoText =
+        analysisMode
+            ? QStringLiteral("自动生成：误差分析图、质量审查、候选诊断；补偿图/CSV 请在模块6查看")
+            : QStringLiteral("自动生成：全景图、轮廓图、拼接汇总、候选诊断；误差/补偿需运行全流程或模块5");
     if (labels.isEmpty()) {
         reportExportStatusLabel_->setText(
             standardCircleMode
                 ? QStringLiteral("归档状态：标准圆结果已生成，请先勾选需要查看的 CSV 类型 | 自动生成：摘要、25点详情、候选覆盖、掩模诊断")
-                : QStringLiteral("归档状态：结果已生成，请先勾选需要导出的 CSV 类型 | 自动生成：设计比对、质量审查、候选诊断"));
+                : QStringLiteral("归档状态：结果已生成，请先勾选需要导出的 CSV 类型 | %1").arg(workpieceAutoText));
         return;
     }
 
@@ -2838,8 +4885,8 @@ void MainWindow::refreshReportExportState(const QString& statusMessage)
     reportExportStatusLabel_->setText(
         (standardCircleMode
              ? QStringLiteral("归档状态：可查看 CSV：%1 | 输出目录：%2 | 自动生成：窗口图、边缘叠加、摘要与掩模诊断")
-             : QStringLiteral("归档状态：可导出 CSV：%1 | 输出目录：%2 | 自动生成：设计比对、质量审查、候选诊断"))
-            .arg(labels.join(QStringLiteral(", ")), targetDir));
+             : QStringLiteral("归档状态：可导出 CSV：%1 | 输出目录：%2 | %3"))
+            .arg(labels.join(QStringLiteral(", ")), targetDir, standardCircleMode ? QString() : workpieceAutoText));
 }
 
 void MainWindow::applyWindowStyle()
@@ -3027,6 +5074,12 @@ QPlainTextEdit, QListWidget, QTableView {
     selection-color: #102033;
     alternate-background-color: #fbfdff;
 }
+QPlainTextEdit#acceptanceOverviewEdit {
+    background: #f8fbf4;
+    border-color: #cfe1bd;
+    color: #244a34;
+    font-size: 11px;
+}
 QGraphicsView {
     background: #1f2832;
     border: 1px solid #304252;
@@ -3157,6 +5210,10 @@ QWidget#calibrationConfigSection QToolButton#configSectionToggle,
 QWidget#calibrationConfigSection QGroupBox {
     color: #4e4a72;
 }
+QWidget#designModelConfigSection QToolButton#configSectionToggle,
+QWidget#designModelConfigSection QGroupBox {
+    color: #7a4d2a;
+}
 QWidget#acquisitionConfigSection QToolButton#configSectionToggle,
 QWidget#acquisitionConfigSection QGroupBox {
     color: #265779;
@@ -3189,6 +5246,10 @@ QGroupBox::title {
 QWidget#calibrationConfigSection QGroupBox {
     border-left: 4px solid #6a648f;
     background: #faf9fd;
+}
+QWidget#designModelConfigSection QGroupBox {
+    border-left: 4px solid #9a6540;
+    background: #fdf9f5;
 }
 QWidget#acquisitionConfigSection QGroupBox {
     border-left: 4px solid #39688a;

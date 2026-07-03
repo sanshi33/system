@@ -9,6 +9,7 @@
 
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <string>
@@ -633,7 +634,8 @@ TransformResult buildEvaluatedPriorTransform(const EdgeVariants& previousEdges,
                                              double angleDeg,
                                              MotionPriorDirection direction,
                                              double tangentResidualCostWeight,
-                                             double tangentCorrelationCostWeight)
+                                             double tangentCorrelationCostWeight,
+                                             bool useUnfoldedTangentCorrelation = true)
 {
     TransformResult fallback = makeTranslationPriorFallback(dx, dy, angleDeg, direction);
     fallback.score = 0.0;
@@ -647,7 +649,10 @@ TransformResult buildEvaluatedPriorTransform(const EdgeVariants& previousEdges,
         sortContourByY(rotatedTarget);
     }
 
-    populateAlignmentMetrics(previousEdges.ordered(fallback.axis), rotatedTarget, fallback);
+    populateAlignmentMetrics(previousEdges.ordered(fallback.axis),
+                             rotatedTarget,
+                             fallback,
+                             useUnfoldedTangentCorrelation);
 
     const double normalRmse = preferredNormalRmse(fallback);
     const double tangentRmse = preferredTangentRmse(fallback);
@@ -673,7 +678,8 @@ TransformResult buildEvaluatedCustomMatrixTransform(const EdgeVariants& previous
                                                     const TransformResult& baseTransform,
                                                     MotionPriorDirection direction,
                                                     double tangentResidualCostWeight,
-                                                    double tangentCorrelationCostWeight)
+                                                    double tangentCorrelationCostWeight,
+                                                    bool useUnfoldedTangentCorrelation = true)
 {
     TransformResult evaluated = baseTransform;
     evaluated.score = 0.0;
@@ -689,7 +695,10 @@ TransformResult buildEvaluatedCustomMatrixTransform(const EdgeVariants& previous
         sortContourByY(transformedTarget);
     }
 
-    populateAlignmentMetrics(previousEdges.ordered(evaluated.axis), transformedTarget, evaluated);
+    populateAlignmentMetrics(previousEdges.ordered(evaluated.axis),
+                             transformedTarget,
+                             evaluated,
+                             useUnfoldedTangentCorrelation);
 
     const double normalRmse = preferredNormalRmse(evaluated);
     const double tangentRmse = preferredTangentRmse(evaluated);
@@ -884,6 +893,13 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
     if (!std::isfinite(currentNormal) || !std::isfinite(currentCoverage)) {
         return currentTransform;
     }
+    if (!aggressiveSearch &&
+        currentNormal <= 0.12 &&
+        currentCoverage >= 0.70 &&
+        currentCorrelation >= 0.85 &&
+        currentContinuity <= 3.0) {
+        return currentTransform;
+    }
 
     const bool primaryIsX = directionUsesPrimaryX(stepDirection);
     const auto primaryShiftOf = [&](double dx, double dy) {
@@ -903,7 +919,8 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
                                            angleDeg,
                                            stepDirection,
                                            config.tangentResidualCostWeight,
-                                           config.tangentCorrelationCostWeight);
+                                           config.tangentCorrelationCostWeight,
+                                           false);
     };
 
     TransformResult bestTransform = currentTransform;
@@ -976,7 +993,10 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
         perpShiftOf(imageCorrelationEstimate.dx, imageCorrelationEstimate.dy);
     const double primaryGapPx = std::abs(imagePrimary - currentPrimary);
     const double perpGapPx = std::abs(imagePerp - currentPerp);
-    std::vector<double> seedBlendFactors{0.0, 1.0, 0.5};
+    const bool compactLocalSearch = !aggressiveSearch && currentContinuity <= 6.0;
+    std::vector<double> seedBlendFactors = compactLocalSearch
+                                               ? std::vector<double>{0.0, 1.0}
+                                               : std::vector<double>{0.0, 1.0, 0.5};
     if (aggressiveSearch) {
         seedBlendFactors.push_back(0.25);
         seedBlendFactors.push_back(0.75);
@@ -995,12 +1015,14 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
     const double coarseAngleStepDeg = aggressiveSearch ? 0.01 : 0.01;
     const double coarsePrimaryHalfRangePx =
         aggressiveSearch ? std::clamp(primaryGapPx + 3.0, 3.5, 6.0)
-                         : std::clamp(primaryGapPx + 0.8, 0.8, 2.0);
+                         : (compactLocalSearch ? std::clamp(primaryGapPx + 0.5, 0.6, 1.4)
+                                               : std::clamp(primaryGapPx + 0.8, 0.8, 2.0));
     const double coarsePerpHalfRangePx =
         aggressiveSearch ? std::clamp(perpGapPx + 2.0, 2.5, 4.0)
-                         : std::clamp(perpGapPx + 0.8, 1.0, 2.0);
-    const double coarsePrimaryStepPx = aggressiveSearch ? 0.75 : 0.2;
-    const double coarsePerpStepPx = aggressiveSearch ? 0.75 : 0.2;
+                         : (compactLocalSearch ? std::clamp(perpGapPx + 0.5, 0.8, 1.4)
+                                               : std::clamp(perpGapPx + 0.8, 1.0, 2.0));
+    const double coarsePrimaryStepPx = aggressiveSearch ? 0.75 : (compactLocalSearch ? 0.25 : 0.2);
+    const double coarsePerpStepPx = aggressiveSearch ? 0.75 : (compactLocalSearch ? 0.25 : 0.2);
 
     for (std::size_t seedIndex = 0; seedIndex < seedPrimary.size(); ++seedIndex) {
         for (double angleOffsetDeg = -coarseAngleHalfRangeDeg;
@@ -1023,8 +1045,8 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
     const double refinedPrimary = primaryShiftOf(bestTransform.dx, bestTransform.dy);
     const double refinedPerp = perpShiftOf(bestTransform.dx, bestTransform.dy);
     const double fineAngleHalfRangeDeg = aggressiveSearch ? 0.02 : 0.01;
-    const double finePrimaryHalfRangePx = aggressiveSearch ? 1.0 : 0.5;
-    const double finePerpHalfRangePx = aggressiveSearch ? 1.0 : 0.5;
+    const double finePrimaryHalfRangePx = aggressiveSearch ? 1.0 : (compactLocalSearch ? 0.3 : 0.5);
+    const double finePerpHalfRangePx = aggressiveSearch ? 1.0 : (compactLocalSearch ? 0.3 : 0.5);
     for (double angleOffsetDeg = -fineAngleHalfRangeDeg;
          angleOffsetDeg <= fineAngleHalfRangeDeg + 1e-9;
          angleOffsetDeg += 0.005) {
@@ -1042,8 +1064,8 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
     }
 
     const double ultraFineAngleHalfRangeDeg = aggressiveSearch ? 0.01 : 0.005;
-    const double ultraFinePrimaryHalfRangePx = aggressiveSearch ? 0.35 : 0.25;
-    const double ultraFinePerpHalfRangePx = aggressiveSearch ? 0.35 : 0.25;
+    const double ultraFinePrimaryHalfRangePx = aggressiveSearch ? 0.35 : (compactLocalSearch ? 0.18 : 0.25);
+    const double ultraFinePerpHalfRangePx = aggressiveSearch ? 0.35 : (compactLocalSearch ? 0.18 : 0.25);
     const double ultraFinePrimary = primaryShiftOf(bestTransform.dx, bestTransform.dy);
     const double ultraFinePerp = perpShiftOf(bestTransform.dx, bestTransform.dy);
     for (double angleOffsetDeg = -ultraFineAngleHalfRangeDeg;
@@ -1062,12 +1084,28 @@ TransformResult refineEndpointStepWithImageGuidedNormalSearchViews(const EdgeVar
         }
     }
 
-    if (bestTransform.candidateDiagnostics.empty() &&
-        !currentTransform.candidateDiagnostics.empty()) {
-        bestTransform.candidateDiagnostics = currentTransform.candidateDiagnostics;
+    const std::vector<AlignmentCandidateDiagnostic> candidateDiagnostics = bestTransform.candidateDiagnostics;
+    TransformResult preciseBestTransform =
+        buildEvaluatedPriorTransform(previousView,
+                                     nextView,
+                                     center,
+                                     bestTransform.dx,
+                                     bestTransform.dy,
+                                     bestTransform.da,
+                                     stepDirection,
+                                     config.tangentResidualCostWeight,
+                                     config.tangentCorrelationCostWeight,
+                                     true);
+    preciseBestTransform.direction = motionDirectionLabel(stepDirection);
+    if (preciseBestTransform.candidateDiagnostics.empty()) {
+        if (!candidateDiagnostics.empty()) {
+            preciseBestTransform.candidateDiagnostics = candidateDiagnostics;
+        } else if (!currentTransform.candidateDiagnostics.empty()) {
+            preciseBestTransform.candidateDiagnostics = currentTransform.candidateDiagnostics;
+        }
     }
 
-    return bestTransform;
+    return preciseBestTransform.hasCandidate() ? preciseBestTransform : bestTransform;
 }
 
 TransformResult refineEndpointStepWithImageGuidedNormalSearch(const EdgeVariants& previousEdges,
@@ -3045,6 +3083,7 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
         emitProgress(callbacks, "stitch", i + 1, totalSteps);
         emitLog(callbacks,
                 "\n>>> 正在拼接图像 " + std::to_string(i + 1) + " 与图像 " + std::to_string(i + 2) + "...");
+        const auto stepBegin = std::chrono::steady_clock::now();
 
         EdgeVariants nextEdges = edgesPrepared[i + 1];
         if (nextEdges.size() < 100) {
@@ -3083,10 +3122,44 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
         const TrajectoryPriorEstimate trajectoryPrior =
             estimateTrajectoryPrior(reliableTransformHistory, stepDirection);
         const bool useTrajectoryLocalFirstPass = trajectoryPrior.ok && hasReliableMotionPrior;
-        const double pairPriorX = useTrajectoryLocalFirstPass ? trajectoryPrior.dx : approxShiftX;
-        const double pairPriorY = useTrajectoryLocalFirstPass ? trajectoryPrior.dy : approxShiftY;
+        double pairPriorX = useTrajectoryLocalFirstPass ? trajectoryPrior.dx : approxShiftX;
+        double pairPriorY = useTrajectoryLocalFirstPass ? trajectoryPrior.dy : approxShiftY;
         const double pairPriorAngle = useTrajectoryLocalFirstPass ? trajectoryPrior.angleDeg : approxAngleDeg;
         const bool hasFixedDirectionPrior = stepDirection != MotionPriorDirection::Auto;
+        ImageCorrelationShiftEstimate imageCorrelationEstimate;
+        bool useImageCorrelationLocalFirstPass = false;
+        double imageLocalPrimaryHalfRangePx = 0.0;
+        double imageLocalPerpHalfRangePx = 0.0;
+        if (!useTrajectoryLocalFirstPass && hasFixedDirectionPrior) {
+            const bool primaryIsX = directionUsesPrimaryX(stepDirection);
+            const double nominalPrimaryShiftPx = primaryIsX ? approxInitX : approxInitY;
+            const double primaryPriorShiftPx = primaryIsX ? pairPriorX : pairPriorY;
+            const double secondaryPriorShiftPx = primaryIsX ? pairPriorY : pairPriorX;
+            imageCorrelationEstimate =
+                estimateImageCorrelationShift(images[i],
+                                              images[i + 1],
+                                              stepDirection,
+                                              primaryPriorShiftPx,
+                                              secondaryPriorShiftPx,
+                                              nominalPrimaryShiftPx);
+            if (imageCorrelationEstimate.ok) {
+                const double imagePriorDeltaPx =
+                    std::hypot(imageCorrelationEstimate.dx - pairPriorX,
+                               imageCorrelationEstimate.dy - pairPriorY);
+                if (imageCorrelationEstimate.score >= 0.35 &&
+                    imagePriorDeltaPx <= std::max(90.0, config.baseSearchRange * 0.85)) {
+                    pairPriorX = imageCorrelationEstimate.dx;
+                    pairPriorY = imageCorrelationEstimate.dy;
+                    useImageCorrelationLocalFirstPass = true;
+                    const double imagePrimaryShiftPx = primaryIsX ? pairPriorX : pairPriorY;
+                    const double imagePerpShiftPx = primaryIsX ? pairPriorY : pairPriorX;
+                    imageLocalPrimaryHalfRangePx =
+                        std::clamp(std::abs(imagePrimaryShiftPx - nominalPrimaryShiftPx) + 90.0, 90.0, 140.0);
+                    imageLocalPerpHalfRangePx =
+                        std::clamp(std::abs(imagePerpShiftPx) + 18.0, 20.0, 48.0);
+                }
+            }
+        }
         const double targetNormalRmsePx =
             estimateRecentStableRmsePx(reliableTransformHistory,
                                        hasLastReliableTransform ? &lastReliableTransform : nullptr);
@@ -3101,12 +3174,25 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
                 pairRotationMinDeg = config.rotationSearchMinDeg;
                 pairRotationMaxDeg = config.rotationSearchMaxDeg;
             }
+        } else if (useImageCorrelationLocalFirstPass) {
+            pairRotationMinDeg = std::max(config.rotationSearchMinDeg, pairPriorAngle - 0.15);
+            pairRotationMaxDeg = std::min(config.rotationSearchMaxDeg, pairPriorAngle + 0.15);
         }
 
+        if (useImageCorrelationLocalFirstPass) {
+            std::ostringstream initialImagePriorLog;
+            initialImagePriorLog << "    [Info] Initial pass seeded by raw-image coarse shift dx="
+                                 << pairPriorX << ", dy=" << pairPriorY
+                                 << ", corr=" << imageCorrelationEstimate.score << ".";
+            emitLog(callbacks, initialImagePriorLog.str());
+        }
+
+        const auto initialMatchBegin = std::chrono::steady_clock::now();
         TransformResult transform = matchOnePair(previousEdges, nextEdges, center,
                                                  pairPriorX, pairPriorY,
                                                  pairPriorAngle,
-                                                 hasReliableMotionPrior || useTrajectoryLocalFirstPass,
+                                                 hasReliableMotionPrior || useTrajectoryLocalFirstPass ||
+                                                     useImageCorrelationLocalFirstPass,
                                                  config.baseSearchRange,
                                                  stepDirection,
                                                  pairRotationMinDeg,
@@ -3114,10 +3200,21 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
                                                  config.rotationSearchStepDeg,
                                                  config.tangentResidualCostWeight,
                                                  config.tangentCorrelationCostWeight,
-                                                 useTrajectoryLocalFirstPass,
-                                                 useTrajectoryLocalFirstPass ? trajectoryPrior.primaryWindowPx : 0.0,
-                                                 useTrajectoryLocalFirstPass ? trajectoryPrior.perpWindowPx : 0.0,
+                                                 useTrajectoryLocalFirstPass || useImageCorrelationLocalFirstPass,
+                                                 useTrajectoryLocalFirstPass ? trajectoryPrior.primaryWindowPx
+                                                                            : imageLocalPrimaryHalfRangePx,
+                                                 useTrajectoryLocalFirstPass ? trajectoryPrior.perpWindowPx
+                                                                            : imageLocalPerpHalfRangePx,
                                                  searchRangeX, searchRangeY);
+        const auto initialMatchEnd = std::chrono::steady_clock::now();
+        const double initialMatchSeconds =
+            std::chrono::duration<double>(initialMatchEnd - initialMatchBegin).count();
+        if (!transform.profilingSummary.empty()) {
+            emitLog(callbacks,
+                    "    [Profile] initial matchOnePair runtime = " +
+                        std::to_string(initialMatchSeconds) + " s | " +
+                        transform.profilingSummary);
+        }
 
         bool useQualityLocalRescan = false;
         bool useCandidateReselect = false;
@@ -3136,7 +3233,6 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
         bool useLastStepNormalGridRefine = false;
         bool useLastStepAffineShearRefine = false;
         bool usedMotionPriorFallback = false;
-        ImageCorrelationShiftEstimate imageCorrelationEstimate;
         const auto normalRmseFor = [](const TransformResult& result) {
             const ResidualStatistics& normal =
                 result.metrics.normalInlier.valid() ? result.metrics.normalInlier : result.metrics.normalAll;
@@ -3632,9 +3728,11 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
                 maybeAcceptPriorRefine(std::move(priorAffineRefined), usePriorAffineShearRefine);
             }
         }
+        const double endpointImageRefineThresholdPx =
+            useImageCorrelationLocalFirstPass ? 0.14 : 0.10;
         if (isEndpointStep &&
             imageCorrelationEstimate.ok &&
-            currentNormal > 0.1) {
+            currentNormal > endpointImageRefineThresholdPx) {
             const bool useAggressiveEndpointSearch =
                 isLastStep && !config.endpointProbeFastMode;
             TransformResult endpointRefined =
@@ -3648,8 +3746,12 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
                                                               targetNormalRmsePx,
                                                               false,
                                                               useAggressiveEndpointSearch);
+            const double filteredEndpointNormal = normalRmseFor(endpointRefined);
             if (!config.endpointProbeFastMode &&
-                previousEdges.hasUnfiltered() && nextEdges.hasUnfiltered()) {
+                previousEdges.hasUnfiltered() && nextEdges.hasUnfiltered() &&
+                (!std::isfinite(filteredEndpointNormal) ||
+                 filteredEndpointNormal > 0.12 ||
+                 currentNormal > 0.14)) {
                 TransformResult endpointUnfilteredRefined =
                     refineEndpointStepWithImageGuidedNormalSearch(previousEdges,
                                                                   nextEdges,
@@ -4381,6 +4483,14 @@ StitchingResult runStitchingPipeline(const std::vector<cv::Mat>& images,
             emitLog(callbacks, "    [警告] 匹配得分过高，已将近似位移重置为初始值。");
         }
         previousDirection = stepDirection;
+        const auto stepEnd = std::chrono::steady_clock::now();
+        const double stepSeconds = std::chrono::duration<double>(stepEnd - stepBegin).count();
+        if (!transform.profilingSummary.empty()) {
+            emitLog(callbacks, "    [Profile] " + transform.profilingSummary);
+        }
+        emitLog(callbacks,
+                "    [Timing] stitch step " + std::to_string(i + 1) +
+                    " runtime = " + std::to_string(stepSeconds) + " s");
     }
 
     // --- 位姿图全局优化 ---

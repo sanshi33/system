@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cad_design/DesignProfileTypes.h"
+
 #include <opencv2/core.hpp>
 
 #include <cstddef>
@@ -72,6 +74,7 @@ struct EdgeVariants {
     std::vector<double> rawConfidences;
     std::vector<double> rawGradients;
     std::vector<unsigned char> rawSyntheticFlags;
+    std::string preprocessingMode;
     std::vector<cv::Point2d> unfiltered_raw;
     std::vector<cv::Point2d> x_sorted;
     std::vector<cv::Point2d> y_sorted;
@@ -178,6 +181,7 @@ struct TransformResult {
     cv::Mat customRelativeMatrix;
     std::vector<double> inlierErrors;
     std::vector<double> inlierCoordinates;
+    std::vector<double> sampleArcCoordinates;
     std::vector<double> samplePrimaryCoordinates;
     std::vector<double> sampleRefSecondaryCoordinates;
     std::vector<double> sampleTargetSecondaryCoordinates;
@@ -186,6 +190,14 @@ struct TransformResult {
     std::vector<int> sampleInlierFlags;
     AlignmentMetrics metrics;
     std::vector<AlignmentCandidateDiagnostic> candidateDiagnostics;
+    int profilingCoarseEvaluations{0};
+    int profilingCoarseAccepted{0};
+    int profilingFineEvaluations{0};
+    int profilingFineAccepted{0};
+    double profilingCoarseSeconds{0.0};
+    double profilingFineSeconds{0.0};
+    double profilingRefineSeconds{0.0};
+    std::string profilingSummary;
 
     [[nodiscard]] bool hasCandidate() const noexcept { return score < 1e8; }
 };
@@ -270,7 +282,7 @@ struct StitchPipelineConfig {
     bool endpointProbeFastMode = false; ///< 是否启用最后一步 endpoint 快速探测模式。
     bool enableLastStepReferencePriorHalfOverlapProbe = false; ///< 是否启用最后一步“上一张位移先验 + 50% 重叠区”专项探测。
     bool designEvaluateProfileForm = true; ///< 是否基于去均值后的法向残差评价轮廓波动。
-    bool designReverseZ = true; ///< 实测从左到右是否对应原始设计 z 从大到小。
+    bool designReverseAxial = false; ///< 设计轴向是否反向展开；真实 CAD 默认按所选轴正向展开。
     bool designUseLeftEndpointAnchor = true; ///< 是否使用左端点作为轴向锚点。
     bool designAnchorRadialToLeftEndpoint = true; ///< 是否把径向零位锚定到左端点。
     bool designEnableBestFitTranslation = true; ///< 是否允许在锚定后做小范围平移微调。
@@ -296,8 +308,23 @@ struct StitchPipelineConfig {
     double designTrimLeftAfterEndpointMm = 0.0; ///< 左端点后额外裁掉的长度。
     double designTrimRightMm = 0.0; ///< 右端额外裁掉的长度。
     bool designIgnoreStepTransition = true; ///< 是否忽略台阶过渡区，避免其影响设计比对优化与统计。
-    double designStepTransitionOriginalZMm = 119.0; ///< 台阶过渡在原始设计 z 坐标中的中心位置。
+    double designStepTransitionOriginalZMm = 119.0; ///< 台阶过渡在原始设计轴向坐标中的中心位置。
     double designStepTransitionHalfWidthMm = 0.35; ///< 台阶过渡区在轴向上的半宽；默认仅忽略台阶段极窄核心，避免整段中部被过度删点。
+    bool designUseExternalProfile = false; ///< 是否优先使用外部 CAD 采样轮廓作为设计基准。
+    double designTargetSlotWidthMm = 0.0; ///< 可选目标槽宽，用于特征级补偿复核。
+    double designTargetSlotDepthMm = 0.0; ///< 可选目标槽深，用于特征级补偿复核。
+    bool localSlotImageMode = false; ///< 是否按用户已截取好的单槽局部图直接检测/标定/补偿。
+    double localSlotBottomWidthMm = 1.527; ///< 局部槽底部真实距离，作为单图像素当量标定基准。
+    double localSlotPixelSizeOverrideMm = 0.0; ///< 大于 0 时直接覆盖局部槽像素当量。
+    double localSlotPixelSizeScale = 1.001; ///< 局部槽像素当量修正系数，避免单宽度标定强制零误差。
+    std::size_t localSlotMaxOutputPoints = 1600; ///< 局部槽补偿 CSV 最多保留的有效边缘点。
+    bool designUseCentralSlotImageRoi = false;
+    double designImageRoiXRatio = 0.40;
+    double designImageRoiYRatio = 0.15;
+    double designImageRoiWidthRatio = 0.24;
+    double designImageRoiHeightRatio = 0.105;
+    pinjie::cad_design::DesignProfileMetadata designProfileMetadata{}; ///< 当前设计基准来源与范围信息。
+    std::vector<pinjie::cad_design::DesignProfileSample> designExternalProfileSamples; ///< 外部 CAD 采样轮廓(s,r)。
 };
 
 /**
@@ -330,7 +357,11 @@ struct StitchRunRequest {
     std::string csvOutputPath;
     std::string designErrorProfileCsvOutputPath;
     std::string designErrorSummaryCsvOutputPath;
+    std::string design3dErrorCsvOutputPath;
+    std::string designCompensationCsvOutputPath;
+    std::string designFeatureCompensationCsvOutputPath;
     std::string designComparisonOverlayOutputPath;
+    std::string designCompensationPlotOutputPath;
     std::string qualityReviewCsvOutputPath;
     std::string alignmentCandidateDiagnosticsCsvOutputPath;
     bool saveStepSummaryCsv{true};
@@ -403,6 +434,7 @@ struct StitchRunResult {
     StitchingResult stitching;
     std::string csvText;
     std::shared_ptr<StitchRunCache> cache;
+    bool singleSlotContourPreviewGenerated{false};
 };
 
 } // namespace stitch
